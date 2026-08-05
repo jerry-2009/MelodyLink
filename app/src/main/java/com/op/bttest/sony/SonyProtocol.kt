@@ -76,6 +76,26 @@ class SonyProtocol(
         )
     }
 
+    suspend fun getBatteryState(): SonyBatteryState? {
+        ensureInitialized()
+        var state = SonyBatteryState()
+        var received = false
+        for (type in intArrayOf(SonyBatteryType.DUAL, SonyBatteryType.CASE)) {
+            val response = client.sendCommandForResponse(
+                messageType = SonyMessageType.COMMAND_1,
+                payload = SonyPayloads.buildBatteryRequest(version, type),
+                timeoutMs = 5_000L,
+            ) { frame ->
+                frame.messageType == SonyMessageType.COMMAND_1 &&
+                    SonyPayloads.parseBatteryState(frame.payload, version, type) != null
+            } ?: continue
+            val parsed = SonyPayloads.parseBatteryState(response.payload, version, type) ?: continue
+            state = state.merge(parsed)
+            received = true
+        }
+        return state.takeIf { received }
+    }
+
     private suspend fun ensureInitialized() {
         if (!initialized) {
             initialized = initialize()
@@ -233,6 +253,59 @@ internal object SonyPayloads {
                 SonyAsmType.ASM_ON_OFF
 
             else -> DEFAULT_V2_ASM_TYPE
+        }
+    }
+
+    fun buildBatteryRequest(version: SonyProtocolVersion, type: Int): ByteArray = byteArrayOf(
+        when (version) {
+            SonyProtocolVersion.V1 -> SonyPayloadTypeV1T1.COMMON_GET_BATTERY_LEVEL
+            SonyProtocolVersion.V2 -> SonyPayloadTypeV2T1.POWER_GET_STATUS
+        }.asByte(),
+        type.asByte(),
+    )
+
+    fun parseBatteryState(
+        payload: ByteArray,
+        version: SonyProtocolVersion,
+        expectedType: Int,
+    ): SonyBatteryState? {
+        val opcodes = when (version) {
+            SonyProtocolVersion.V1 -> setOf(
+                SonyPayloadTypeV1T1.COMMON_RET_BATTERY_LEVEL,
+                SonyPayloadTypeV1T1.COMMON_NTFY_BATTERY_LEVEL,
+            )
+            SonyProtocolVersion.V2 -> setOf(
+                SonyPayloadTypeV2T1.POWER_RET_STATUS,
+                SonyPayloadTypeV2T1.POWER_NTFY_STATUS,
+            )
+        }
+        if (payload.size < 4 || payload[0].u8() !in opcodes || payload[1].u8() != expectedType) {
+            return null
+        }
+
+        fun battery(levelIndex: Int, statusIndex: Int, zeroMeansMissing: Boolean): SonyBattery? {
+            if (statusIndex >= payload.size) return null
+            val level = payload[levelIndex].u8()
+            if (zeroMeansMissing && level == 0) return null
+            val chargingStatus = payload[statusIndex].u8()
+            val charging = when (version) {
+                SonyProtocolVersion.V1 -> chargingStatus == 0x01
+                SonyProtocolVersion.V2 -> chargingStatus == 0x01 || chargingStatus == 0x03
+            }
+            return SonyBattery(level.coerceIn(0, 100), charging)
+        }
+
+        return when (expectedType) {
+            SonyBatteryType.DUAL -> {
+                if (payload.size < 6) null else SonyBatteryState(
+                    left = battery(2, 3, zeroMeansMissing = true),
+                    right = battery(4, 5, zeroMeansMissing = true),
+                )
+            }
+            SonyBatteryType.CASE -> SonyBatteryState(
+                case = battery(2, 3, zeroMeansMissing = false),
+            )
+            else -> null
         }
     }
 

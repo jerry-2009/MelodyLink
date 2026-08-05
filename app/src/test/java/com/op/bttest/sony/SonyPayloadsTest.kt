@@ -113,4 +113,75 @@ class SonyPayloadsTest {
         assertEquals(true, state?.focusOnVoice)
         assertEquals(12, state?.ambientLevel)
     }
+
+    @Test
+    fun buildsV1BatteryRequest() {
+        assertArrayEquals(
+            byteArrayOf(0x10, 0x01),
+            SonyPayloads.buildBatteryRequest(SonyProtocolVersion.V1, SonyBatteryType.DUAL),
+        )
+    }
+
+    @Test
+    fun buildsV2BatteryRequest() {
+        assertArrayEquals(
+            byteArrayOf(0x22, 0x02),
+            SonyPayloads.buildBatteryRequest(SonyProtocolVersion.V2, SonyBatteryType.CASE),
+        )
+    }
+
+    @Test
+    fun parsesV1DualBatteryWithChargingLeftEar() {
+        val state = SonyPayloads.parseBatteryState(
+            byteArrayOf(0x11, 0x01, 76, 0x01, 54, 0x00),
+            SonyProtocolVersion.V1,
+            SonyBatteryType.DUAL,
+        )
+
+        assertEquals(76, state?.left?.percent)
+        assertEquals(true, state?.left?.charging)
+        assertEquals(54, state?.right?.percent)
+        assertEquals(false, state?.right?.charging)
+    }
+
+    @Test
+    fun parsesV2BatteryNotificationAndTreatsChargedAsCharging() {
+        val state = SonyPayloads.parseBatteryState(
+            byteArrayOf(0x25, 0x02, 100.toByte(), 0x03),
+            SonyProtocolVersion.V2,
+            SonyBatteryType.CASE,
+        )
+
+        assertEquals(100, state?.case?.percent)
+        assertEquals(true, state?.case?.charging)
+    }
+
+    @Test
+    fun preservesCaseZeroButSkipsMissingEarbudZero() {
+        val ears = SonyPayloads.parseBatteryState(
+            byteArrayOf(0x23, 0x01, 0x00, 0x00, 42, 0x01),
+            SonyProtocolVersion.V2,
+            SonyBatteryType.DUAL,
+        )
+        val case = SonyPayloads.parseBatteryState(
+            byteArrayOf(0x23, 0x02, 0x00, 0x00),
+            SonyProtocolVersion.V2,
+            SonyBatteryType.CASE,
+        )
+
+        assertNull(ears?.left)
+        assertEquals(42, ears?.right?.percent)
+        assertEquals(0, case?.case?.percent)
+    }
+
+    @Test
+    fun rejectsMalformedBatteryPayload() {
+        assertNull(
+            SonyPayloads.parseBatteryState(
+                byteArrayOf(0x23, 0x01, 50, 0x00),
+                SonyProtocolVersion.V2,
+                SonyBatteryType.DUAL,
+            ),
+        )
+    }
 }

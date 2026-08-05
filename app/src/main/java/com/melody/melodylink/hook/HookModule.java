@@ -14,6 +14,8 @@ import com.melody.melodylink.observer.MethodCallObserver;
 import com.melody.melodylink.sony.SonyTransportAdapter;
 import com.op.bttest.sony.SonyAncMode;
 import com.op.bttest.sony.SonyAncState;
+import com.op.bttest.sony.SonyBattery;
+import com.op.bttest.sony.SonyBatteryState;
 
 import java.lang.reflect.Method;
 import java.lang.reflect.Field;
@@ -39,17 +41,20 @@ public final class HookModule extends XposedModule {
     private static final String TARGET = "com.oplus.melody";
     private static final String SHARED_STATE_FILE = ".melodylink_sony_state";
     private static final String SHARED_COMMAND_FILE = ".melodylink_sony_anc_command";
+    private static final String SHARED_BATTERY_COMMAND_FILE = ".melodylink_sony_battery_command";
     private static final int CUSTOM_ANC_CONTROLS_TAG = 0x4D4C4143;
     private static final int WF_1000XM3_PRODUCT_ID = 0x067410;
     private volatile int targetAddressHash;
     private volatile String targetAddress;
     private volatile Object earphoneRepository;
     private volatile SonyAncState sonyState;
+    private volatile SonyBatteryState sonyBatteryState;
     private volatile ClassLoader melodyClassLoader;
     private volatile CompletableFuture<Object> pendingNoiseWrite;
     private volatile ScheduledExecutorService foregroundStateWatcher;
     private volatile String lastForegroundStateFingerprint;
     private volatile String lastSonyCommandFingerprint;
+    private volatile String lastSonyBatteryCommandNonce;
     private final ThreadLocal<Boolean> detailAncWriteObserved = new ThreadLocal<>();
     private final SonyTransportAdapter sonyTransport = new SonyTransportAdapter(new SonyTransportAdapter.Listener() {
         @Override
@@ -62,7 +67,14 @@ public final class HookModule extends XposedModule {
             sonyState = state;
             writeSharedSonyState();
             log(Log.INFO, TAG, event("Sony RFCOMM connected; ANC state=" + state.getMode()));
+            publishSonyBatteryState("Sony connected");
             refreshTargetRepository("Sony connected");
+        }
+
+        @Override
+        public void onBatteryState(SonyBatteryState state) {
+            sonyBatteryState = mergeBatteryState(sonyBatteryState, state);
+            publishSonyBatteryState("Sony battery read");
         }
 
         @Override
@@ -96,6 +108,7 @@ public final class HookModule extends XposedModule {
         public void onDisconnected() {
             failPendingNoiseWrite("Sony transport disconnected");
             sonyState = null;
+            sonyBatteryState = null;
             clearSharedSonyState();
             log(Log.INFO, TAG, event("Sony RFCOMM disconnected"));
             refreshTargetRepository("Sony disconnected");
@@ -105,6 +118,7 @@ public final class HookModule extends XposedModule {
         public void onFailed(String reason) {
             failPendingNoiseWrite(reason);
             sonyState = null;
+            sonyBatteryState = null;
             clearSharedSonyState();
             log(Log.WARN, TAG, event("Sony RFCOMM failed: " + reason));
             refreshTargetRepository("Sony failed");
@@ -123,6 +137,7 @@ public final class HookModule extends XposedModule {
             if (isPrimaryProcess()) {
                 clearSharedSonyState();
                 clearSharedSonyCommand();
+                clearSharedSonyBatteryCommand();
             }
             ClassLoader loader = param.getClassLoader();
             melodyClassLoader = loader;
@@ -232,6 +247,7 @@ public final class HookModule extends XposedModule {
                         if (chain.getThisObject() instanceof Activity) {
                             scheduleCustomAncControls((Activity) chain.getThisObject(),
                                     method.getDeclaringClass().getClassLoader());
+                            requestSonyBatteryRefresh();
                         }
                         return result;
                     }
@@ -787,6 +803,11 @@ public final class HookModule extends XposedModule {
         return application == null ? null : new File(application.getFilesDir(), SHARED_COMMAND_FILE);
     }
 
+    private static File sharedBatteryCommandFile() {
+        Application application = currentApplication();
+        return application == null ? null : new File(application.getFilesDir(), SHARED_BATTERY_COMMAND_FILE);
+    }
+
     private void writeSharedSonyState() {
         if (!isPrimaryProcess() || targetAddress == null) return;
         File file = sharedStateFile();
@@ -825,6 +846,51 @@ public final class HookModule extends XposedModule {
         File file = sharedCommandFile();
         if (file != null && file.exists() && !file.delete()) {
             log(Log.WARN, TAG, "shared Sony ANC command delete failed");
+        }
+    }
+
+    private void requestSonyBatteryRefresh() {
+        String address = targetAddress;
+        if (address == null) address = readSharedSonyAddress();
+        if (!isTargetAddress(address)) return;
+        if (isPrimaryProcess()) {
+            sonyTransport.refreshBattery();
+            return;
+        }
+        writeSharedSonyBatteryCommand(address);
+    }
+
+    private boolean writeSharedSonyBatteryCommand(String address) {
+        File file = sharedBatteryCommandFile();
+        if (file == null) return false;
+        try (FileOutputStream output = new FileOutputStream(file, false)) {
+            output.write((address + "\n" + System.nanoTime() + "\n").getBytes(StandardCharsets.US_ASCII));
+            return true;
+        } catch (Throwable t) {
+            log(Log.WARN, TAG, "shared Sony battery command write failed", t);
+            return false;
+        }
+    }
+
+    private void clearSharedSonyBatteryCommand() {
+        File file = sharedBatteryCommandFile();
+        if (file != null && file.exists() && !file.delete()) {
+            log(Log.WARN, TAG, "shared Sony battery command delete failed");
+        }
+    }
+
+    private static SharedSonyBatteryCommand readSharedSonyBatteryCommand() {
+        File file = sharedBatteryCommandFile();
+        if (file == null || !file.isFile()) return null;
+        try (FileInputStream input = new FileInputStream(file)) {
+            byte[] buffer = new byte[128];
+            int count = input.read(buffer);
+            if (count <= 0) return null;
+            String[] lines = new String(buffer, 0, count, StandardCharsets.US_ASCII).split("\\r?\\n");
+            if (lines.length < 2) return null;
+            return new SharedSonyBatteryCommand(lines[0].trim(), lines[1].trim());
+        } catch (Throwable ignored) {
+            return null;
         }
     }
 
@@ -893,6 +959,16 @@ public final class HookModule extends XposedModule {
         }
     }
 
+    private static final class SharedSonyBatteryCommand {
+        final String address;
+        final String nonce;
+
+        SharedSonyBatteryCommand(String address, String nonce) {
+            this.address = address;
+            this.nonce = nonce;
+        }
+    }
+
     private void captureRepository(String label, XposedInterface.Chain chain) {
         if (!label.startsWith("repository") && !"noiseWrite".equals(label)) return;
         Object address = null;
@@ -933,7 +1009,10 @@ public final class HookModule extends XposedModule {
     }
 
     private void observeSharedSonyState() {
-        if (isPrimaryProcess()) observeSharedSonyCommand();
+        if (isPrimaryProcess()) {
+            observeSharedSonyCommand();
+            observeSharedSonyBatteryCommand();
+        }
         SharedSonyState state = readSharedSonyState();
         String fingerprint = state == null
                 ? null
@@ -963,6 +1042,17 @@ public final class HookModule extends XposedModule {
         }
         log(Log.INFO, TAG, event("executing forwarded Sony ANC mode write index=" + command.modeIndex));
         startSonyNoiseWriteFuture(command.modeIndex, melodyClassLoader);
+    }
+
+    private void observeSharedSonyBatteryCommand() {
+        SharedSonyBatteryCommand command = readSharedSonyBatteryCommand();
+        if (command == null || command.nonce.equals(lastSonyBatteryCommandNonce)) return;
+        lastSonyBatteryCommandNonce = command.nonce;
+        if (!isTargetAddress(command.address)) {
+            log(Log.WARN, TAG, event("ignored Sony battery refresh for a different device"));
+            return;
+        }
+        sonyTransport.refreshBattery();
     }
 
     private void refreshTargetRepository(String reason) {
@@ -995,6 +1085,66 @@ public final class HookModule extends XposedModule {
         } catch (Throwable t) {
             log(Log.WARN, TAG, "Melody repository refresh failed", t);
         }
+    }
+
+    private static SonyBatteryState mergeBatteryState(SonyBatteryState previous, SonyBatteryState incoming) {
+        return previous == null ? incoming : previous.merge(incoming);
+    }
+
+    private void publishSonyBatteryState(String reason) {
+        if (!isPrimaryProcess()) return;
+        SonyBatteryState state = sonyBatteryState;
+        Object repository = earphoneRepository;
+        String address = targetAddress;
+        if (state == null || repository == null || address == null) {
+            log(Log.WARN, TAG, event("Sony battery publish skipped: repository or state unavailable"));
+            return;
+        }
+        try {
+            Field statuses = repository.getClass().getDeclaredField("r");
+            statuses.setAccessible(true);
+            Object value = statuses.get(repository);
+            if (!(value instanceof java.util.Map<?, ?>)) {
+                log(Log.WARN, TAG, event("Sony battery publish skipped: Melody V map unavailable"));
+                return;
+            }
+            Object status = ((java.util.Map<?, ?>) value).get(address);
+            if (status == null) {
+                log(Log.WARN, TAG, event("Sony battery publish skipped: target Melody V unavailable"));
+                return;
+            }
+            ClassLoader loader = status.getClass().getClassLoader();
+            Class<?> batteryStatusClass = Class.forName(
+                    "com.oplus.melody.model.repository.earphone.V$a", false, loader);
+            Constructor<?> constructor = batteryStatusClass.getConstructor(int.class, boolean.class);
+            boolean updated = false;
+            updated |= setSonyBatteryStatus(status, "setLeftBatteryStatus", constructor, state.getLeft());
+            updated |= setSonyBatteryStatus(status, "setRightBatteryStatus", constructor, state.getRight());
+            updated |= setSonyBatteryStatus(status, "setBoxBatteryStatus", constructor, state.getCase());
+            if (!updated) {
+                log(Log.INFO, TAG, event("Sony battery publish retained previous Melody values (" + reason + ")"));
+                return;
+            }
+            Method notifyChanged = repository.getClass().getDeclaredMethod("x1", String.class);
+            notifyChanged.setAccessible(true);
+            notifyChanged.invoke(repository, address);
+            log(Log.INFO, TAG, event("published Sony battery through Melody V/U.x1 (" + reason + ")"));
+        } catch (Throwable t) {
+            log(Log.WARN, TAG, "Sony battery publish failed", t);
+        }
+    }
+
+    private static boolean setSonyBatteryStatus(
+            Object status,
+            String setterName,
+            Constructor<?> constructor,
+            SonyBattery battery
+    ) throws Exception {
+        if (battery == null) return false;
+        Object batteryStatus = constructor.newInstance(battery.getPercent(), battery.getCharging());
+        Method setter = status.getClass().getMethod(setterName, batteryStatus.getClass());
+        setter.invoke(status, batteryStatus);
+        return true;
     }
 
     private static Object findProfile(Object value, String id, String name) {

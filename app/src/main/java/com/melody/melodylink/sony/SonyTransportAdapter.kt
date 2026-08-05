@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.bluetooth.BluetoothDevice
 import com.op.bttest.sony.SonyAncMode
 import com.op.bttest.sony.SonyAncState
+import com.op.bttest.sony.SonyBatteryState
 import com.op.bttest.sony.SonyLogEntry
 import com.op.bttest.sony.SonyProtocol
 import com.op.bttest.sony.SonyProtocolVersion
@@ -25,6 +26,7 @@ class SonyTransportAdapter(
     interface Listener {
         fun onConnecting()
         fun onConnected(state: SonyAncState)
+        fun onBatteryState(state: SonyBatteryState)
         fun onAncWriteResult(success: Boolean, state: SonyAncState?, reason: String)
         fun onDisconnected()
         fun onFailed(reason: String)
@@ -45,6 +47,10 @@ class SonyTransportAdapter(
 
     @Volatile
     var currentState: SonyAncState? = null
+        private set
+
+    @Volatile
+    var currentBatteryState: SonyBatteryState? = null
         private set
 
     @SuppressLint("MissingPermission")
@@ -73,6 +79,7 @@ class SonyTransportAdapter(
             listener.onConnecting()
             isConnected = false
             currentState = null
+            currentBatteryState = null
             connectedAddress = null
 
             val versions = protocolCandidates(device)
@@ -116,6 +123,10 @@ class SonyTransportAdapter(
                     currentState = state
                     connectedAddress = address
                     connectingAddress = null
+                    candidateProtocol.getBatteryState()?.let {
+                        currentBatteryState = it
+                        listener.onBatteryState(it)
+                    }
                     listener.onConnected(state)
                     return@launch
                 } catch (cancelled: CancellationException) {
@@ -150,6 +161,7 @@ class SonyTransportAdapter(
             val wasConnected = isConnected
             isConnected = false
             currentState = null
+            currentBatteryState = null
             if (wasConnected) listener.onDisconnected()
         }
     }
@@ -184,6 +196,28 @@ class SonyTransportAdapter(
             } catch (throwable: Throwable) {
                 listener.onLog("Sony ANC write failed: ${throwable.javaClass.simpleName}")
                 listener.onAncWriteResult(false, null, "Sony ANC write failed")
+            }
+        }
+    }
+
+    fun refreshBattery() {
+        val request = generation.get()
+        scope.launch {
+            val activeProtocol = protocol
+            if (!isConnected || activeProtocol == null) {
+                listener.onLog("Sony battery refresh requested while disconnected")
+                return@launch
+            }
+            try {
+                val state = activeProtocol.getBatteryState()
+                if (state != null && request == generation.get()) {
+                    currentBatteryState = state
+                    listener.onBatteryState(state)
+                } else if (state == null) {
+                    listener.onLog("Sony battery refresh returned no confirmed values")
+                }
+            } catch (throwable: Throwable) {
+                listener.onLog("Sony battery refresh failed: ${throwable.javaClass.simpleName}")
             }
         }
     }

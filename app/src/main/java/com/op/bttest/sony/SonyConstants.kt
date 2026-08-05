@@ -23,6 +23,23 @@ data class SonyAncState(
     val autoAmbientSensitivity: Int = 0,
 )
 
+data class SonyBattery(
+    val percent: Int,
+    val charging: Boolean,
+)
+
+data class SonyBatteryState(
+    val left: SonyBattery? = null,
+    val right: SonyBattery? = null,
+    val case: SonyBattery? = null,
+) {
+    fun merge(other: SonyBatteryState): SonyBatteryState = SonyBatteryState(
+        left = other.left ?: left,
+        right = other.right ?: right,
+        case = other.case ?: case,
+    )
+}
+
 interface SonyAncController {
     suspend fun connect(device: BluetoothDevice, version: SonyProtocolVersion): Boolean
     suspend fun disconnect()
@@ -80,6 +97,9 @@ object SonyPayloadTypeV1T1 {
     const val CONNECT_RET_DEVICE_INFO = 0x05
     const val CONNECT_GET_SUPPORT_FUNCTION = 0x06
     const val CONNECT_RET_SUPPORT_FUNCTION = 0x07
+    const val COMMON_GET_BATTERY_LEVEL = 0x10
+    const val COMMON_RET_BATTERY_LEVEL = 0x11
+    const val COMMON_NTFY_BATTERY_LEVEL = 0x13
     const val NC_ASM_GET_PARAM = 0x66
     const val NC_ASM_RET_PARAM = 0x67
     const val NC_ASM_SET_PARAM = 0x68
@@ -93,10 +113,18 @@ object SonyPayloadTypeV2T1 {
     const val CONNECT_RET_DEVICE_INFO = 0x05
     const val CONNECT_GET_SUPPORT_FUNCTION = 0x06
     const val CONNECT_RET_SUPPORT_FUNCTION = 0x07
+    const val POWER_GET_STATUS = 0x22
+    const val POWER_RET_STATUS = 0x23
+    const val POWER_NTFY_STATUS = 0x25
     const val NCASM_GET_PARAM = 0x66
     const val NCASM_RET_PARAM = 0x67
     const val NCASM_SET_PARAM = 0x68
     const val NCASM_NTFY_PARAM = 0x69
+}
+
+object SonyBatteryType {
+    const val DUAL = 0x01
+    const val CASE = 0x02
 }
 
 object SonyFunctionTypeV1T1 {
