@@ -2,8 +2,13 @@ package com.melody.melodylink.hook;
 
 import android.bluetooth.BluetoothDevice;
 import android.annotation.SuppressLint;
+import android.app.Activity;
 import android.app.Application;
 import android.util.Log;
+import android.view.View;
+import android.view.ViewGroup;
+import android.widget.Button;
+import android.widget.LinearLayout;
 
 import com.melody.melodylink.observer.MethodCallObserver;
 import com.melody.melodylink.sony.SonyTransportAdapter;
@@ -33,6 +38,8 @@ public final class HookModule extends XposedModule {
     private static final String TAG = "MelodyLinkObserver";
     private static final String TARGET = "com.oplus.melody";
     private static final String SHARED_STATE_FILE = ".melodylink_sony_state";
+    private static final String SHARED_COMMAND_FILE = ".melodylink_sony_anc_command";
+    private static final int CUSTOM_ANC_CONTROLS_TAG = 0x4D4C4143;
     private static final int WF_1000XM3_PRODUCT_ID = 0x067410;
     private volatile int targetAddressHash;
     private volatile String targetAddress;
@@ -42,6 +49,8 @@ public final class HookModule extends XposedModule {
     private volatile CompletableFuture<Object> pendingNoiseWrite;
     private volatile ScheduledExecutorService foregroundStateWatcher;
     private volatile String lastForegroundStateFingerprint;
+    private volatile String lastSonyCommandFingerprint;
+    private final ThreadLocal<Boolean> detailAncWriteObserved = new ThreadLocal<>();
     private final SonyTransportAdapter sonyTransport = new SonyTransportAdapter(new SonyTransportAdapter.Listener() {
         @Override
         public void onConnecting() {
@@ -111,7 +120,10 @@ public final class HookModule extends XposedModule {
     public void onPackageReady(PackageReadyParam param) {
         if (!TARGET.equals(param.getPackageName())) return;
         try {
-            if (isPrimaryProcess()) clearSharedSonyState();
+            if (isPrimaryProcess()) {
+                clearSharedSonyState();
+                clearSharedSonyCommand();
+            }
             ClassLoader loader = param.getClassLoader();
             melodyClassLoader = loader;
             hookNamed(loader, "com.oplus.melody.common.util.V", "a", 3, "whitelist");
@@ -127,6 +139,7 @@ public final class HookModule extends XposedModule {
             hookNamed(loader, "com.oplus.melody.btsdk.api.data.DeviceInfo", "setDeviceLeAudioConnectState", 2, "leAudioState");
             hookNamed(loader, "com.oplus.melody.ui.component.detail.DetailMainViewModel", "f", 1, "detailState");
             hookNamed(loader, "com.oplus.melody.ui.component.detail.DetailMainViewModel", "g", 1, "detailConnectionState");
+            hookNamed(loader, "com.oplus.melody.ui.component.detail.DetailMainActivity", "onCreate", 1, "detailActivityCreate");
             hookNamed(loader, "com.oplus.melody.model.repository.earphone.U", "z", 1, "repositoryObserve");
             hookNamed(loader, "com.oplus.melody.model.repository.earphone.U", "y", 1, "repositoryGet");
             hookNamed(loader, "com.oplus.melody.model.repository.earphone.U", "g1", 1, "repositoryDtoBuild");
@@ -144,6 +157,7 @@ public final class HookModule extends XposedModule {
             hookNamed(loader, "com.oplus.melody.ui.component.detail.opsreduction.a", "getCurrentNoiseReductionModeIndex", 0, "opsNoiseReductionMode");
             hookNamed(loader, "pa.C1405p", "getCurrentNoiseReductionModeIndex", 0, "noiseReductionModeVO");
             hookNamed(loader, "com.oplus.melody.ui.component.detail.noisereduction.NoiseReductionItem", "onEarphoneDataChanged", 1, "noiseReductionItemDataChanged");
+            hookNamed(loader, "com.oplus.melody.ui.component.detail.noisereduction.NoiseReductionItem$a", "c", 2, "nativeNoiseReductionClick");
             hookNamed(loader, "com.oplus.melody.btsdk.multidevice.HeadsetCoreService", "u", 2, "connectToDevice");
             hookNamed(loader, "com.oplus.melody.btsdk.multidevice.HeadsetCoreService", "v", 1, "connectImmediate");
             hookNamed(loader, "com.oplus.melody.btsdk.multidevice.HeadsetCoreService", "u0", 2, "sendPacket");
@@ -166,7 +180,8 @@ public final class HookModule extends XposedModule {
             hookNamed(loader, "com.oplus.melody.ui.component.detail.opsreduction.OpsReductionItem", "onBindViewHolder", 1, "opsReductionItemBound");
             hookNamed(loader, "com.oplus.melody.ui.component.detail.opsreduction.buttonseekbar.NoiseReductionButtonSeekBarView", "h", 0, "opsReductionSwitchToCurrentMode");
             hookNamed(loader, "com.oplus.melody.ui.component.detail.opsreduction.buttonseekbar.NoiseReductionButtonSeekBarView", "i", 0, "opsReductionUpdateActionView");
-            if (!isPrimaryProcess()) startForegroundStateWatcher();
+            hookNamed(loader, "com.oplus.melody.ui.component.detail.opsreduction.buttonseekbar.NoiseReductionButtonSeekBarView", "d", 0, "opsReductionApplyMode");
+            startForegroundStateWatcher();
         } catch (Throwable t) {
             log(Log.ERROR, TAG, "hook setup failed", t);
         }
@@ -212,10 +227,28 @@ public final class HookModule extends XposedModule {
                 }
                 try {
                     captureRepository(label, chain);
+                    if ("detailActivityCreate".equals(label)) {
+                        Object result = chain.proceed();
+                        if (chain.getThisObject() instanceof Activity) {
+                            scheduleCustomAncControls((Activity) chain.getThisObject(),
+                                    method.getDeclaringClass().getClassLoader());
+                        }
+                        return result;
+                    }
                     if ("noiseReductionItemDataChanged".equals(label)) {
                         Object result = chain.proceed();
                         log(Log.INFO, TAG, event("Melody native ANC LiveData callback completed"));
                         return result;
+                    }
+                    if ("nativeNoiseReductionClick".equals(label)) {
+                        int modeIndex = readNativeNoiseReductionMode(chain.getThisObject(), chain.getArg(0));
+                        String address = readNativeNoiseReductionAddress(chain.getThisObject());
+                        if (isTargetAddress(address) && modeIndex >= 0) {
+                            log(Log.INFO, TAG, event("intercepted native ANC click mode=" + modeIndex));
+                            dispatchCustomAncWrite(modeIndex, method.getDeclaringClass().getClassLoader());
+                            return null;
+                        }
+                        return chain.proceed();
                     }
                     if ("repositoryDtoBuild".equals(label)) {
                         Object result = chain.proceed();
@@ -243,6 +276,27 @@ public final class HookModule extends XposedModule {
                         log(Log.INFO, TAG, event("Melody OPS ANC UI " + label + " completed"));
                         return result;
                     }
+                    if ("opsReductionApplyMode".equals(label)) {
+                        int modeIndex = readSelectedNoiseReductionMode(chain.getThisObject());
+                        String address = readNoiseReductionAddress(chain.getThisObject());
+                        log(Log.INFO, TAG, event("ANC apply UI entry mode=" + modeIndex
+                                + " target=" + isTargetAddress(address)));
+                        detailAncWriteObserved.set(false);
+                        Object result;
+                        try {
+                            result = chain.proceed();
+                        } finally {
+                            Boolean observed = detailAncWriteObserved.get();
+                            detailAncWriteObserved.remove();
+                            if (!isPrimaryProcess() && !Boolean.TRUE.equals(observed)
+                                    && isTargetAddress(address) && modeIndex >= 0) {
+                            log(Log.INFO, TAG, event("forwarding ANC from confirmed detail UI entry mode="
+                                    + modeIndex));
+                            forwardSonyNoiseWrite(modeIndex, method.getDeclaringClass().getClassLoader());
+                            }
+                        }
+                        return result;
+                    }
                     if ("nativeConnectDevice".equals(label) && isTargetDeviceInfo(chain.getArg(0))) {
                         startSonyConnection(chain.getArg(0));
                         log(Log.WARN, TAG, event("bypassed OPPO E7.c.b/C7.b for WF-1000XM3"));
@@ -259,11 +313,14 @@ public final class HookModule extends XposedModule {
                         return null;
                     }
                     if ("noiseModeWrite".equals(label) && isTargetAddress(chain.getArg(1))) {
+                        detailAncWriteObserved.set(true);
                         if (isPrimaryProcess()) {
                             log(Log.INFO, TAG, event("intercepted Sony ANC mode write index=" + chain.getArg(0)));
                             return startSonyNoiseWriteFuture(chain.getArg(0), method.getDeclaringClass().getClassLoader());
                         }
-                        log(Log.INFO, TAG, event("Sony ANC mode write reached non-primary repository; preserving provider bridge"));
+                        log(Log.INFO, TAG, event("forwarding Sony ANC mode write to primary process index="
+                                + chain.getArg(0)));
+                        return forwardSonyNoiseWrite(chain.getArg(0), method.getDeclaringClass().getClassLoader());
                     }
                     if ("noiseWrite".equals(label) && isTargetAddress(chain.getArg(1))) {
                         if (hasPendingNoiseWrite()) {
@@ -470,6 +527,151 @@ public final class HookModule extends XposedModule {
         return future;
     }
 
+    private Object forwardSonyNoiseWrite(Object rawIndex, ClassLoader loader) {
+        CompletableFuture<Object> future = new CompletableFuture<>();
+        if (!(rawIndex instanceof Integer)) {
+            future.completeExceptionally(new IllegalArgumentException("invalid Sony ANC mode index"));
+            return future;
+        }
+        SonyAncMode mode = SonyModeMapper.fromMelodyIndex((Integer) rawIndex);
+        String address = targetAddress;
+        if (mode == null || address == null) {
+            future.completeExceptionally(new IllegalStateException("Sony ANC bridge is not ready"));
+            return future;
+        }
+        melodyClassLoader = loader;
+        if (!writeSharedSonyCommand(address, (Integer) rawIndex)) {
+            future.completeExceptionally(new IllegalStateException("Sony ANC bridge command failed"));
+            return future;
+        }
+        Object result = createSetCommandState(0);
+        if (result == null) {
+            future.completeExceptionally(new IllegalStateException("Sony ANC result DTO unavailable"));
+        } else {
+            future.complete(result);
+        }
+        return future;
+    }
+
+    private void scheduleCustomAncControls(Activity activity, ClassLoader loader) {
+        View root = activity.getWindow().getDecorView();
+        root.postDelayed(() -> installCustomAncControls(activity, loader), 750L);
+        root.postDelayed(() -> installCustomAncControls(activity, loader), 2_000L);
+    }
+
+    private void installCustomAncControls(Activity activity, ClassLoader loader) {
+        String address = targetAddress;
+        if (address == null) address = readSharedSonyAddress();
+        if (!isTargetAddress(address)) return;
+
+        ViewGroup root = activity.findViewById(android.R.id.content);
+        View nativeControl = findViewByClassName(root,
+                "com.oplus.melody.ui.component.detail.opsreduction.buttonseekbar.NoiseReductionButtonSeekBarView");
+        if (nativeControl == null || !(nativeControl.getParent() instanceof ViewGroup)) return;
+        ViewGroup parent = (ViewGroup) nativeControl.getParent();
+        if (parent.findViewWithTag(CUSTOM_ANC_CONTROLS_TAG) != null) return;
+
+        nativeControl.setVisibility(View.GONE);
+        LinearLayout controls = new LinearLayout(activity);
+        controls.setTag(CUSTOM_ANC_CONTROLS_TAG);
+        controls.setOrientation(LinearLayout.HORIZONTAL);
+        controls.setGravity(android.view.Gravity.CENTER);
+        controls.setPadding(24, 16, 24, 16);
+        controls.addView(createAncButton(activity, "关闭", 0, loader),
+                new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        controls.addView(createAncButton(activity, "环境声", 1, loader),
+                new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        controls.addView(createAncButton(activity, "降噪", 2, loader),
+                new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        parent.addView(controls, new ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        log(Log.INFO, TAG, event("installed custom Sony ANC controls"));
+    }
+
+    private Button createAncButton(Activity activity, String text, int modeIndex, ClassLoader loader) {
+        Button button = new Button(activity);
+        button.setText(text);
+        button.setAllCaps(false);
+        button.setOnClickListener(view -> {
+            log(Log.INFO, TAG, event("custom Sony ANC click mode=" + modeIndex));
+            dispatchCustomAncWrite(modeIndex, loader);
+        });
+        return button;
+    }
+
+    private void dispatchCustomAncWrite(int modeIndex, ClassLoader loader) {
+        if (isPrimaryProcess()) {
+            startSonyNoiseWriteFuture(modeIndex, loader);
+        } else {
+            forwardSonyNoiseWrite(modeIndex, loader);
+        }
+    }
+
+    private static View findViewByClassName(View view, String className) {
+        if (view == null) return null;
+        if (className.equals(view.getClass().getName())) return view;
+        if (!(view instanceof ViewGroup)) return null;
+        ViewGroup group = (ViewGroup) view;
+        for (int i = 0; i < group.getChildCount(); i++) {
+            View found = findViewByClassName(group.getChildAt(i), className);
+            if (found != null) return found;
+        }
+        return null;
+    }
+
+    private static int readSelectedNoiseReductionMode(Object view) {
+        Object selectedValue = readField(view, "s");
+        if (!(selectedValue instanceof Integer)) return -1;
+        switch ((Integer) selectedValue) {
+            case 1: return 0;
+            case 2: return 1;
+            case 4: return 2;
+            case 8: return 3;
+            case 16: return 4;
+            default: return -1;
+        }
+    }
+
+    private static int readNativeNoiseReductionMode(Object listener, Object modeItem) {
+        if (listener == null || modeItem == null) return -1;
+        try {
+            Method getPosition = modeItem.getClass().getMethod("f");
+            Object positionValue = getPosition.invoke(modeItem);
+            if (!(positionValue instanceof String)) return -1;
+            int position = Integer.parseInt((String) positionValue);
+            Object item = readField(listener, "a");
+            Object modes = readField(item, "mNoiseReductionModeList");
+            if (!(modes instanceof java.util.List<?>)) return -1;
+            java.util.List<?> modeList = (java.util.List<?>) modes;
+            if (position < 0 || position >= modeList.size()) return -1;
+            Object mode = modeList.get(position);
+            Method getProtocolIndex = mode.getClass().getMethod("getProtocolIndex");
+            Object protocolIndex = getProtocolIndex.invoke(mode);
+            return protocolIndex instanceof Integer ? (Integer) protocolIndex : -1;
+        } catch (Throwable ignored) {
+            return -1;
+        }
+    }
+
+    private static String readNativeNoiseReductionAddress(Object listener) {
+        Object item = readField(listener, "a");
+        Object viewModel = readField(item, "mViewModel");
+        Object address = readField(viewModel, "b");
+        return address instanceof String ? (String) address : null;
+    }
+
+    private static String readNoiseReductionAddress(Object view) {
+        Object bus = readField(view, "f");
+        if (bus == null) return null;
+        try {
+            Method getAddress = bus.getClass().getMethod("getAddress");
+            Object address = getAddress.invoke(bus);
+            return address instanceof String ? (String) address : null;
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
     private synchronized boolean hasPendingNoiseWrite() {
         return pendingNoiseWrite != null && !pendingNoiseWrite.isDone();
     }
@@ -580,6 +782,11 @@ public final class HookModule extends XposedModule {
         return application == null ? null : new File(application.getFilesDir(), SHARED_STATE_FILE);
     }
 
+    private static File sharedCommandFile() {
+        Application application = currentApplication();
+        return application == null ? null : new File(application.getFilesDir(), SHARED_COMMAND_FILE);
+    }
+
     private void writeSharedSonyState() {
         if (!isPrimaryProcess() || targetAddress == null) return;
         File file = sharedStateFile();
@@ -598,6 +805,41 @@ public final class HookModule extends XposedModule {
         File file = sharedStateFile();
         if (file != null && file.exists() && !file.delete()) {
             log(Log.WARN, TAG, "shared Sony state delete failed");
+        }
+    }
+
+    private boolean writeSharedSonyCommand(String address, int modeIndex) {
+        File file = sharedCommandFile();
+        if (file == null) return false;
+        String content = address + "\n" + modeIndex + "\n" + System.nanoTime() + "\n";
+        try (FileOutputStream output = new FileOutputStream(file, false)) {
+            output.write(content.getBytes(StandardCharsets.US_ASCII));
+            return true;
+        } catch (Throwable t) {
+            log(Log.WARN, TAG, "shared Sony ANC command write failed", t);
+            return false;
+        }
+    }
+
+    private void clearSharedSonyCommand() {
+        File file = sharedCommandFile();
+        if (file != null && file.exists() && !file.delete()) {
+            log(Log.WARN, TAG, "shared Sony ANC command delete failed");
+        }
+    }
+
+    private static SharedSonyCommand readSharedSonyCommand() {
+        File file = sharedCommandFile();
+        if (file == null || !file.isFile()) return null;
+        try (FileInputStream input = new FileInputStream(file)) {
+            byte[] buffer = new byte[128];
+            int count = input.read(buffer);
+            if (count <= 0) return null;
+            String[] lines = new String(buffer, 0, count, StandardCharsets.US_ASCII).split("\\r?\\n");
+            if (lines.length < 3) return null;
+            return new SharedSonyCommand(lines[0].trim(), Integer.parseInt(lines[1].trim()), lines[2].trim());
+        } catch (Throwable ignored) {
+            return null;
         }
     }
 
@@ -636,6 +878,18 @@ public final class HookModule extends XposedModule {
         SharedSonyState(String address, int modeIndex) {
             this.address = address;
             this.modeIndex = modeIndex;
+        }
+    }
+
+    private static final class SharedSonyCommand {
+        final String address;
+        final int modeIndex;
+        final String nonce;
+
+        SharedSonyCommand(String address, int modeIndex, String nonce) {
+            this.address = address;
+            this.modeIndex = modeIndex;
+            this.nonce = nonce;
         }
     }
 
@@ -679,6 +933,7 @@ public final class HookModule extends XposedModule {
     }
 
     private void observeSharedSonyState() {
+        if (isPrimaryProcess()) observeSharedSonyCommand();
         SharedSonyState state = readSharedSonyState();
         String fingerprint = state == null
                 ? null
@@ -694,6 +949,20 @@ public final class HookModule extends XposedModule {
         log(Log.INFO, TAG, event("foreground Sony state changed; requesting native Melody LiveData refresh"
                 + " mode=" + (state == null ? -1 : state.modeIndex)));
         refreshTargetRepository("foreground shared Sony state changed");
+    }
+
+    private void observeSharedSonyCommand() {
+        SharedSonyCommand command = readSharedSonyCommand();
+        if (command == null) return;
+        String fingerprint = command.address + "\n" + command.modeIndex + "\n" + command.nonce;
+        if (fingerprint.equals(lastSonyCommandFingerprint)) return;
+        lastSonyCommandFingerprint = fingerprint;
+        if (!isTargetAddress(command.address)) {
+            log(Log.WARN, TAG, event("ignored Sony ANC command for a different device"));
+            return;
+        }
+        log(Log.INFO, TAG, event("executing forwarded Sony ANC mode write index=" + command.modeIndex));
+        startSonyNoiseWriteFuture(command.modeIndex, melodyClassLoader);
     }
 
     private void refreshTargetRepository(String reason) {
