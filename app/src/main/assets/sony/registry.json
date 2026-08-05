@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "manufacturer": "sony",
+  "devices": [
+    "sony/config/LinkBuds.json", "sony/config/LinkBudsS.json", "sony/config/Sony-ULT.json",
+    "sony/config/WF-1000XM3.json", "sony/config/WF-1000XM4.json", "sony/config/WF-1000XM5.json", "sony/config/WF-1000XM6.json",
+    "sony/config/WF-C500.json", "sony/config/WF-C510.json", "sony/config/WF-C700N.json", "sony/config/WF-C710N.json", "sony/config/WF-SP800N.json",
+    "sony/config/WH-1000XM2.json", "sony/config/WH-1000XM3.json", "sony/config/WH-1000XM4.json", "sony/config/WH-1000XM5.json", "sony/config/WH-1000XM6.json",
+    "sony/config/WH-CH720N.json", "sony/config/WH-XB900N.json", "sony/config/WH-XB910N.json",
+    "sony/config/WI-C100.json", "sony/config/WI-SP600N.json"
+  ]
+}

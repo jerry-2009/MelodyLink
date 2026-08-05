@@ -2,10 +2,17 @@ package com.melody.melodylink.sony
 
 import android.annotation.SuppressLint
 import android.bluetooth.BluetoothDevice
+import com.melody.melodylink.sony.config.DeviceIdentity
+import com.melody.melodylink.sony.config.SonyBatteryLayout
+import com.melody.melodylink.sony.config.SonyConfigRegistry
+import com.melody.melodylink.sony.config.SonyDeviceConfig
+import com.melody.melodylink.sony.config.SonySupportLevel
 import com.op.bttest.sony.SonyAncMode
 import com.op.bttest.sony.SonyAncState
+import com.op.bttest.sony.SonyBatteryType
 import com.op.bttest.sony.SonyBatteryState
 import com.op.bttest.sony.SonyLogEntry
+import com.op.bttest.sony.SonyPayloads
 import com.op.bttest.sony.SonyProtocol
 import com.op.bttest.sony.SonyProtocolVersion
 import com.op.bttest.sony.SonyRfcommClient
@@ -20,8 +27,9 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 
 /** Target-only Sony transport facade with a Java-callable callback surface. */
-class SonyTransportAdapter(
+class SonyTransportAdapter @JvmOverloads constructor(
     private val listener: Listener,
+    configRegistry: SonyConfigRegistry? = SonyConfigRegistry.empty(),
 ) {
     interface Listener {
         fun onConnecting()
@@ -38,6 +46,11 @@ class SonyTransportAdapter(
     private var activeJob: Job? = null
     private var client: SonyRfcommClient? = null
     private var protocol: SonyProtocol? = null
+    private var activeConfig: SonyDeviceConfig? = null
+    @Volatile
+    private var configRegistry: SonyConfigRegistry? = configRegistry
+    @Volatile
+    private var experimentalWritesEnabled = false
     private var connectingAddress: String? = null
     private var connectedAddress: String? = null
 
@@ -52,6 +65,18 @@ class SonyTransportAdapter(
     @Volatile
     var currentBatteryState: SonyBatteryState? = null
         private set
+
+    fun setConfigRegistry(registry: SonyConfigRegistry) {
+        configRegistry = registry
+    }
+
+    fun isRegisteredDevice(bluetoothName: String?): Boolean =
+        bluetoothName != null && configRegistry?.findBest(DeviceIdentity(bluetoothName = bluetoothName)) != null
+
+    /** Enables writes only for profiles explicitly marked EXPERIMENTAL. */
+    fun setExperimentalWritesEnabled(enabled: Boolean) {
+        experimentalWritesEnabled = enabled
+    }
 
     @SuppressLint("MissingPermission")
     @Synchronized
@@ -72,6 +97,16 @@ class SonyTransportAdapter(
             return
         }
 
+        val requestedConfig = resolveConfig(device)
+        if (configRegistry != null && requestedConfig == null) {
+            listener.onFailed("Sony device is not registered in the configuration catalog")
+            return
+        }
+        if (requestedConfig?.supportLevel == SonySupportLevel.UNSUPPORTED) {
+            listener.onFailed("Sony device profile is marked unsupported")
+            return
+        }
+
         val request = generation.incrementAndGet()
         activeJob?.cancel()
         connectingAddress = address
@@ -81,8 +116,9 @@ class SonyTransportAdapter(
             currentState = null
             currentBatteryState = null
             connectedAddress = null
+            activeConfig = null
 
-            val versions = protocolCandidates(device)
+            val versions = protocolCandidates(device, requestedConfig)
             var lastFailure = "no Sony protocol connection succeeded"
             for (version in versions) {
                 if (request != generation.get()) return@launch
@@ -102,7 +138,15 @@ class SonyTransportAdapter(
                         candidate.disconnect()
                         continue
                     }
-                    val candidateProtocol = SonyProtocol(candidate, version)
+                    val candidateProtocol = SonyProtocol(
+                        client = candidate,
+                        version = version,
+                        defaultV1AsmType = requestedConfig?.protocol?.defaultV1AsmType
+                            ?: SonyPayloads.DEFAULT_V1_ASM_TYPE,
+                        defaultV2AsmType = requestedConfig?.protocol?.defaultV2AsmType
+                            ?: SonyPayloads.DEFAULT_V2_ASM_TYPE,
+                        v1WindSupported = requestedConfig?.quirks?.v1WindSupported ?: true,
+                    )
                     protocol = candidateProtocol
                     if (!candidateProtocol.initialize()) {
                         lastFailure = "Sony ${version.name} protocol initialization failed"
@@ -123,7 +167,8 @@ class SonyTransportAdapter(
                     currentState = state
                     connectedAddress = address
                     connectingAddress = null
-                    candidateProtocol.getBatteryState()?.let {
+                    activeConfig = requestedConfig
+                    candidateProtocol.getBatteryState(batteryTypes(requestedConfig))?.let {
                         currentBatteryState = it
                         listener.onBatteryState(it)
                     }
@@ -156,6 +201,7 @@ class SonyTransportAdapter(
             client?.disconnect()
             client = null
             protocol = null
+            activeConfig = null
             connectingAddress = null
             connectedAddress = null
             val wasConnected = isConnected
@@ -174,6 +220,11 @@ class SonyTransportAdapter(
                 listener.onFailed("Sony ANC write requested while disconnected")
                 return@launch
             }
+            val config = activeConfig
+            if (config != null && !config.permitsAncWrites(mode, experimentalWritesEnabled)) {
+                listener.onAncWriteResult(false, null, "Sony ANC writes are not enabled for ${config.id}")
+                return@launch
+            }
             try {
                 val ok = activeProtocol.setAncMode(
                     SonyAncState(
@@ -186,7 +237,11 @@ class SonyTransportAdapter(
                     listener.onAncWriteResult(false, null, "Sony ANC write failed")
                     return@launch
                 }
-                val state = activeProtocol.getAncState()
+                val state = if (config?.quirks?.requiresAncReadAfterWrite != false) {
+                    activeProtocol.getAncState()
+                } else {
+                    currentState
+                }
                 if (state == null) {
                     listener.onAncWriteResult(false, null, "Sony ANC state refresh failed")
                 } else {
@@ -209,7 +264,7 @@ class SonyTransportAdapter(
                 return@launch
             }
             try {
-                val state = activeProtocol.getBatteryState()
+                val state = activeProtocol.getBatteryState(batteryTypes(activeConfig))
                 if (state != null && request == generation.get()) {
                     currentBatteryState = state
                     listener.onBatteryState(state)
@@ -223,7 +278,21 @@ class SonyTransportAdapter(
     }
 
     @SuppressLint("MissingPermission")
-    private fun protocolCandidates(device: BluetoothDevice): List<SonyProtocolVersion> {
+    private fun protocolCandidates(
+        device: BluetoothDevice,
+        config: SonyDeviceConfig?,
+    ): List<SonyProtocolVersion> {
+        if (config != null) {
+            val knownUuids = try {
+                device.uuids?.map { it.uuid }?.toSet().orEmpty()
+            } catch (_: SecurityException) {
+                emptySet()
+            }
+            return config.protocol.versions.sortedWith(
+                compareByDescending<SonyProtocolVersion> { config.protocol.rfcommUuids[it] in knownUuids }
+                    .thenByDescending { it == config.protocol.preferredVersion },
+            )
+        }
         return try {
             val uuids: Set<UUID> = device.uuids?.map { it.uuid }?.toSet().orEmpty()
             when {
@@ -234,5 +303,23 @@ class SonyTransportAdapter(
         } catch (_: SecurityException) {
             listOf(SonyProtocolVersion.V2, SonyProtocolVersion.V1)
         }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun resolveConfig(device: BluetoothDevice): SonyDeviceConfig? =
+        configRegistry?.findBest(
+            DeviceIdentity(
+                bluetoothName = try {
+                    device.name
+                } catch (_: SecurityException) {
+                    null
+                },
+            ),
+        )
+
+    private fun batteryTypes(config: SonyDeviceConfig?): IntArray = when (config?.battery?.layout) {
+        SonyBatteryLayout.LEFT_RIGHT_CASE -> intArrayOf(SonyBatteryType.DUAL, SonyBatteryType.CASE)
+        SonyBatteryLayout.LEFT_RIGHT -> intArrayOf(SonyBatteryType.DUAL)
+        else -> intArrayOf()
     }
 }

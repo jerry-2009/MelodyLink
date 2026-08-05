@@ -3,11 +3,13 @@ package com.op.bttest.sony
 class SonyProtocol(
     private val client: SonyRfcommClient,
     private val version: SonyProtocolVersion,
+    defaultV1AsmType: Int = SonyPayloads.DEFAULT_V1_ASM_TYPE,
+    defaultV2AsmType: Int = SonyPayloads.DEFAULT_V2_ASM_TYPE,
+    private val v1WindSupported: Boolean = true,
 ) {
     private var initialized = false
-    private var v1AsmType = SonyPayloads.DEFAULT_V1_ASM_TYPE
-    private var v2AsmType = SonyPayloads.DEFAULT_V2_ASM_TYPE
-    private var v1WindSupported = true
+    private var v1AsmType = defaultV1AsmType
+    private var v2AsmType = defaultV2AsmType
 
     suspend fun initialize(): Boolean {
         val protocolInfoOk = requestProtocolInfo()
@@ -76,11 +78,13 @@ class SonyProtocol(
         )
     }
 
-    suspend fun getBatteryState(): SonyBatteryState? {
+    suspend fun getBatteryState(
+        batteryTypes: IntArray = intArrayOf(SonyBatteryType.DUAL, SonyBatteryType.CASE),
+    ): SonyBatteryState? {
         ensureInitialized()
         var state = SonyBatteryState()
         var received = false
-        for (type in intArrayOf(SonyBatteryType.DUAL, SonyBatteryType.CASE)) {
+        for (type in batteryTypes) {
             val response = client.sendCommandForResponse(
                 messageType = SonyMessageType.COMMAND_1,
                 payload = SonyPayloads.buildBatteryRequest(version, type),

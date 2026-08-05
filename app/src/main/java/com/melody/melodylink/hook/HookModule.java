@@ -4,6 +4,8 @@ import android.bluetooth.BluetoothDevice;
 import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.app.Application;
+import android.content.pm.ApplicationInfo;
+import android.content.res.AssetManager;
 import android.util.Log;
 import android.view.View;
 import android.view.ViewGroup;
@@ -12,6 +14,9 @@ import android.widget.LinearLayout;
 
 import com.melody.melodylink.observer.MethodCallObserver;
 import com.melody.melodylink.sony.SonyTransportAdapter;
+import com.melody.melodylink.sony.config.SonyConfigIssue;
+import com.melody.melodylink.sony.config.SonyConfigLoadResult;
+import com.melody.melodylink.sony.config.SonyConfigLoader;
 import com.op.bttest.sony.SonyAncMode;
 import com.op.bttest.sony.SonyAncState;
 import com.op.bttest.sony.SonyBattery;
@@ -55,6 +60,7 @@ public final class HookModule extends XposedModule {
     private volatile String lastForegroundStateFingerprint;
     private volatile String lastSonyCommandFingerprint;
     private volatile String lastSonyBatteryCommandNonce;
+    private volatile boolean sonyConfigInitialized;
     private final ThreadLocal<Boolean> detailAncWriteObserved = new ThreadLocal<>();
     private final SonyTransportAdapter sonyTransport = new SonyTransportAdapter(new SonyTransportAdapter.Listener() {
         @Override
@@ -134,6 +140,7 @@ public final class HookModule extends XposedModule {
     public void onPackageReady(PackageReadyParam param) {
         if (!TARGET.equals(param.getPackageName())) return;
         try {
+            initializeSonyConfig();
             if (isPrimaryProcess()) {
                 clearSharedSonyState();
                 clearSharedSonyCommand();
@@ -314,18 +321,22 @@ public final class HookModule extends XposedModule {
                         return result;
                     }
                     if ("nativeConnectDevice".equals(label) && isTargetDeviceInfo(chain.getArg(0))) {
-                        startSonyConnection(chain.getArg(0));
-                        log(Log.WARN, TAG, event("bypassed OPPO E7.c.b/C7.b for WF-1000XM3"));
+                        if (!startSonyConnection(chain.getArg(0))) {
+                            return chain.proceed();
+                        }
+                        log(Log.WARN, TAG, event("bypassed OPPO E7.c.b/C7.b for registered Sony device"));
                         return null;
                     }
                     if ("directConnectSpp".equals(label) && isTargetDeviceInfo(chain.getArg(0))) {
                         boolean connect = chain.getArg(1) instanceof Boolean && (Boolean) chain.getArg(1);
                         if (connect) {
-                            startSonyConnection(chain.getArg(0));
+                            if (!startSonyConnection(chain.getArg(0))) {
+                                return chain.proceed();
+                            }
                         } else {
                             sonyTransport.disconnect();
                         }
-                        log(Log.WARN, TAG, event("bypassed OPPO m_spp_le for WF-1000XM3"));
+                        log(Log.WARN, TAG, event("bypassed OPPO m_spp_le for registered Sony device"));
                         return null;
                     }
                     if ("noiseModeWrite".equals(label) && isTargetAddress(chain.getArg(1))) {
@@ -350,10 +361,11 @@ public final class HookModule extends XposedModule {
                     }
                     Object deviceName = arity > 2 ? chain.getArg(2) : null;
                     if ("whitelist".equals(label) && deviceName instanceof String
-                            && DeviceProfileMapper.isWf1000Xm3((String) deviceName)) {
-                        Object profile = findProfile(chain.getArg(0), DeviceProfileMapper.SONY_WF_1000XM3_PROFILE_ID, DeviceProfileMapper.SONY_WF_1000XM3_PROFILE_NAME);
+                            && isRegisteredSonyName((String) deviceName)) {
+                        Object profile = findProfile(chain.getArg(0), DeviceProfileMapper.SONY_TEST_PROFILE_ID, DeviceProfileMapper.SONY_TEST_PROFILE_NAME);
                         if (profile != null) {
-                            log(Log.WARN, TAG, "mapping WF-1000XM3 to OPPO Enco X3 id=067410");
+                            log(Log.WARN, TAG, event("mapping registered Sony device " + deviceName
+                                    + " to OPPO Enco X3 id=067410"));
                             return profile;
                         }
                         log(Log.ERROR, TAG, "OPPO Enco X3 profile not found; preserving original result");
@@ -362,8 +374,6 @@ public final class HookModule extends XposedModule {
                     if ("deviceRegistryGet".equals(label) && chain.getArg(0) instanceof BluetoothDevice) {
                         BluetoothDevice device = (BluetoothDevice) chain.getArg(0);
                         if (isTargetDevice(device)) {
-                            targetAddressHash = device.getAddress().hashCode();
-                            targetAddress = device.getAddress();
                             if (result == null) {
                                 result = registerTargetDevice(chain.getThisObject(), device);
                             }
@@ -419,10 +429,10 @@ public final class HookModule extends XposedModule {
             Method add = managerClass.getDeclaredMethod("c", info.getClass());
             add.setAccessible(true);
             add.invoke(manager, info);
-            log(Log.WARN, TAG, event("registered WF-1000XM3 DeviceInfo through Melody manager"));
+            log(Log.WARN, TAG, event("registered Sony DeviceInfo through Melody manager"));
             return info;
         } catch (Throwable t) {
-            log(Log.ERROR, TAG, "WF-1000XM3 DeviceInfo registration failed", t);
+            log(Log.ERROR, TAG, "Sony DeviceInfo registration failed", t);
             return null;
         }
     }
@@ -431,7 +441,7 @@ public final class HookModule extends XposedModule {
     private boolean shouldTrace(String label, XposedInterface.Chain chain, int arity) {
         if ("whitelist".equals(label)) {
             return arity > 2 && chain.getArg(2) instanceof String
-                    && DeviceProfileMapper.isWf1000Xm3((String) chain.getArg(2));
+                    && isRegisteredSonyName((String) chain.getArg(2));
         }
         if ("deviceRegistryLookup".equals(label)) {
             Object address = chain.getArg(0);
@@ -447,22 +457,34 @@ public final class HookModule extends XposedModule {
     }
 
     @SuppressLint("MissingPermission")
-    private void startSonyConnection(Object deviceInfo) {
+    private boolean startSonyConnection(Object deviceInfo) {
+        if (!initializeSonyConfig()) {
+            log(Log.WARN, TAG, event("Sony connection skipped: configuration is not ready"));
+            return false;
+        }
         try {
             Method addressGetter = deviceInfo.getClass().getMethod("getDeviceAddress");
             Object address = addressGetter.invoke(deviceInfo);
             Method deviceGetter = deviceInfo.getClass().getMethod("getDevice");
             Object device = deviceGetter.invoke(deviceInfo);
             if (!(address instanceof String) || !(device instanceof BluetoothDevice)
-                    || !DeviceProfileMapper.isWf1000Xm3(((BluetoothDevice) device).getName())) {
-                log(Log.WARN, TAG, event("Sony connection skipped: target DeviceInfo has no WF-1000XM3 BluetoothDevice"));
-                return;
+                    || !isTargetDevice((BluetoothDevice) device)) {
+                log(Log.WARN, TAG, event("Sony connection skipped: DeviceInfo has no registered Sony BluetoothDevice"));
+                return false;
             }
-            targetAddressHash = address.hashCode();
-            targetAddress = (String) address;
+            String bluetoothAddress = ((BluetoothDevice) device).getAddress();
+            if (!((String) address).equalsIgnoreCase(bluetoothAddress)) {
+                log(Log.WARN, TAG, event("Sony connection skipped: DeviceInfo address does not match BluetoothDevice"));
+                return false;
+            }
+            rememberTargetAddress(bluetoothAddress);
+            log(Log.INFO, TAG, event("starting Sony session name=" + ((BluetoothDevice) device).getName()
+                    + " addressHash=" + Integer.toHexString(bluetoothAddress.hashCode())));
             sonyTransport.connect((BluetoothDevice) device);
+            return true;
         } catch (Throwable t) {
             log(Log.ERROR, TAG, "Sony connection setup failed", t);
+            return false;
         }
     }
 
@@ -471,10 +493,17 @@ public final class HookModule extends XposedModule {
         try {
             Method getter = value.getClass().getMethod("getDevice");
             Object device = getter.invoke(value);
-            return device instanceof BluetoothDevice && isTargetDevice((BluetoothDevice) device);
+            return device instanceof BluetoothDevice
+                    && isTargetDevice((BluetoothDevice) device)
+                    && isA2dpConnected(value);
         } catch (Throwable ignored) {
             return false;
         }
+    }
+
+    private static boolean isA2dpConnected(Object deviceInfo) {
+        Object state = readField(deviceInfo, "mDeviceA2dpConnectState");
+        return state instanceof Number && ((Number) state).intValue() == 2;
     }
 
     private boolean isTargetAddress(Object value) {
@@ -484,11 +513,6 @@ public final class HookModule extends XposedModule {
 
         String sharedAddress = readSharedSonyAddress();
         if (sharedAddress != null && sharedAddress.equalsIgnoreCase(address)) {
-            rememberTargetAddress(address);
-            return true;
-        }
-
-        if (isWf1000Xm3Address(address)) {
             rememberTargetAddress(address);
             return true;
         }
@@ -623,6 +647,44 @@ public final class HookModule extends XposedModule {
         }
     }
 
+    private synchronized boolean initializeSonyConfig() {
+        if (sonyConfigInitialized) return true;
+        try {
+            Application application = currentApplication();
+            if (application == null) {
+                log(Log.WARN, TAG, event("Sony configuration unavailable: target application not ready"));
+                return false;
+            }
+            ApplicationInfo moduleInfo = getModuleApplicationInfo();
+            String moduleApkPath = moduleInfo.sourceDir;
+            if (moduleApkPath == null || moduleApkPath.isEmpty()) {
+                log(Log.ERROR, TAG, event("Sony configuration unavailable: module APK path is empty"));
+                return false;
+            }
+            AssetManager moduleAssets = application.getAssets();
+            Method addAssetPath = AssetManager.class.getDeclaredMethod("addAssetPath", String.class);
+            addAssetPath.setAccessible(true);
+            Object cookie = addAssetPath.invoke(moduleAssets, moduleApkPath);
+            if (!(cookie instanceof Integer) || ((Integer) cookie) == 0) {
+                log(Log.ERROR, TAG, event("Sony configuration unavailable: cannot open module APK assets"));
+                return false;
+            }
+            SonyConfigLoadResult result = SonyConfigLoader.INSTANCE.fromAssets(moduleAssets);
+            sonyTransport.setConfigRegistry(result.getRegistry());
+            for (SonyConfigIssue issue : result.getIssues()) {
+                log(Log.WARN, TAG, event("Sony configuration skipped " + issue.getPath()
+                        + ": " + issue.getMessage()));
+            }
+            sonyConfigInitialized = true;
+            log(Log.INFO, TAG, event("loaded " + result.getRegistry().getProfiles().size()
+                    + " Sony device profiles from " + moduleApkPath));
+            return true;
+        } catch (Throwable t) {
+            log(Log.ERROR, TAG, "Sony configuration initialization failed", t);
+            return false;
+        }
+    }
+
     private static View findViewByClassName(View view, String className) {
         if (view == null) return null;
         if (className.equals(view.getClass().getName())) return view;
@@ -730,8 +792,12 @@ public final class HookModule extends XposedModule {
     }
 
     @SuppressLint("MissingPermission")
-    private static boolean isTargetDevice(BluetoothDevice device) {
-        return DeviceProfileMapper.isWf1000Xm3(device.getName());
+    private boolean isTargetDevice(BluetoothDevice device) {
+        try {
+            return isRegisteredSonyName(device.getName());
+        } catch (Throwable ignored) {
+            return false;
+        }
     }
 
     private boolean isTargetObject(Object value) {
@@ -759,17 +825,6 @@ public final class HookModule extends XposedModule {
     private boolean isSonyConnected() {
         return targetAddress != null && (sonyTransport.isConnected()
                 || targetAddress.equalsIgnoreCase(readSharedSonyAddress()));
-    }
-
-    @SuppressLint("MissingPermission")
-    private static boolean isWf1000Xm3Address(String address) {
-        try {
-            BluetoothDevice device = android.bluetooth.BluetoothAdapter.getDefaultAdapter()
-                    .getRemoteDevice(address);
-            return device != null && isTargetDevice(device);
-        } catch (Throwable ignored) {
-            return false;
-        }
     }
 
     private void rememberTargetAddress(String address) {
@@ -840,6 +895,10 @@ public final class HookModule extends XposedModule {
             log(Log.WARN, TAG, "shared Sony ANC command write failed", t);
             return false;
         }
+    }
+
+    private boolean isRegisteredSonyName(String bluetoothName) {
+        return initializeSonyConfig() && sonyTransport.isRegisteredDevice(bluetoothName);
     }
 
     private void clearSharedSonyCommand() {
@@ -1073,14 +1132,14 @@ public final class HookModule extends XposedModule {
                     activate.setAccessible(true);
                     activate.invoke(liveData);
                     log(Log.INFO, TAG, event("requested native Melody foreground LiveData reload"
-                            + " for WF-1000XM3 (" + reason + ")"));
+                            + " for registered Sony device (" + reason + ")"));
                     return;
                 }
             }
             Method notifyChanged = repository.getClass().getDeclaredMethod("x1", String.class);
             notifyChanged.setAccessible(true);
             notifyChanged.invoke(repository, address);
-            log(Log.INFO, TAG, event("published native Melody repository update for WF-1000XM3"
+            log(Log.INFO, TAG, event("published native Melody repository update for registered Sony device"
                     + " (" + reason + ")"));
         } catch (Throwable t) {
             log(Log.WARN, TAG, "Melody repository refresh failed", t);
