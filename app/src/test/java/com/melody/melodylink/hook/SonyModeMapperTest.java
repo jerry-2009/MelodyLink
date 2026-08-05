@@ -7,7 +7,7 @@ import com.op.bttest.sony.SonyAncMode;
 
 import org.junit.Test;
 
-public class ObserverModuleTest {
+public class SonyModeMapperTest {
     @Test public void mapsMelodyNoiseIndicesToSonyModes() {
         assertEquals(SonyAncMode.OFF, SonyModeMapper.fromMelodyIndex(0));
         assertEquals(SonyAncMode.AMBIENT_SOUND, SonyModeMapper.fromMelodyIndex(1));
