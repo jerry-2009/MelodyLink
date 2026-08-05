@@ -3,8 +3,6 @@ package com.melody.melodylink.hook;
 import android.bluetooth.BluetoothDevice;
 import android.annotation.SuppressLint;
 import android.app.Application;
-import android.os.Handler;
-import android.os.Looper;
 import android.util.Log;
 
 import com.melody.melodylink.sony.SonyTransportAdapter;
@@ -17,12 +15,7 @@ import java.lang.reflect.Constructor;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
-import java.util.ArrayList;
 import java.util.Collection;
-import java.util.Collections;
-import java.util.List;
-import java.util.Map;
-import java.util.WeakHashMap;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executors;
@@ -47,10 +40,6 @@ public final class ObserverModule extends XposedModule {
     private volatile CompletableFuture<Object> pendingNoiseWrite;
     private volatile ScheduledExecutorService foregroundStateWatcher;
     private volatile String lastForegroundStateFingerprint;
-    private volatile Method noiseReductionItemUpdateMethod;
-    private volatile Handler mainHandler;
-    private final Map<Object, Boolean> targetNoiseReductionItems =
-            Collections.synchronizedMap(new WeakHashMap<>());
     private final SonyTransportAdapter sonyTransport = new SonyTransportAdapter(new SonyTransportAdapter.Listener() {
         @Override
         public void onConnecting() {
@@ -138,12 +127,12 @@ public final class ObserverModule extends XposedModule {
             hookNamed(loader, "com.oplus.melody.ui.component.detail.DetailMainViewModel", "g", 1, "detailConnectionState");
             hookNamed(loader, "com.oplus.melody.model.repository.earphone.U", "z", 1, "repositoryObserve");
             hookNamed(loader, "com.oplus.melody.model.repository.earphone.U", "y", 1, "repositoryGet");
+            hookNamed(loader, "com.oplus.melody.model.repository.earphone.U", "g1", 1, "repositoryDtoBuild");
             hookNamed(loader, "com.oplus.melody.model.repository.earphone.EarphoneDTO", "getConnectionState", 0, "dtoConnectionState");
             hookNamed(loader, "com.oplus.melody.model.repository.earphone.EarphoneDTO", "getAclConnectionState", 0, "dtoAclState");
             hookNamed(loader, "com.oplus.melody.model.repository.earphone.EarphoneDTO", "isSupportSpp", 0, "dtoSupportSpp");
             hookNamed(loader, "com.oplus.melody.model.repository.earphone.EarphoneDTO", "isInitCmdCompleted", 0, "dtoInitCompleted");
             hookNamed(loader, "com.oplus.melody.model.repository.earphone.EarphoneDTO", "getNoiseReductionModeIndex", 0, "dtoNoiseReductionMode");
-            hookNamed(loader, "com.oplus.melody.model.repository.earphone.I", "e", 1, "noiseReductionObserverItem");
             hookNamed(loader, "v9.C1576a", "getConnectionState", 0, "detailInfoConnectionState");
             hookNamed(loader, "v9.C1576a", "getHeadsetConnectionState", 0, "detailInfoHeadsetState");
             hookNamed(loader, "v9.C1576a", "getIsSpp", 0, "detailInfoSupportSpp");
@@ -152,8 +141,6 @@ public final class ObserverModule extends XposedModule {
             hookNamed(loader, "v9.a", "getIsSpp", 0, "detailInfoSupportSppActual");
             hookNamed(loader, "com.oplus.melody.ui.component.detail.opsreduction.a", "getCurrentNoiseReductionModeIndex", 0, "opsNoiseReductionMode");
             hookNamed(loader, "pa.C1405p", "getCurrentNoiseReductionModeIndex", 0, "noiseReductionModeVO");
-            hookNamed(loader, "com.oplus.melody.ui.component.detail.noisereduction.NoiseReductionItem", "onAttached", 0, "noiseReductionItemAttached");
-            hookNamed(loader, "com.oplus.melody.ui.component.detail.noisereduction.NoiseReductionItem", "onBindViewHolder", 1, "noiseReductionItemBound");
             hookNamed(loader, "com.oplus.melody.ui.component.detail.noisereduction.NoiseReductionItem", "onEarphoneDataChanged", 1, "noiseReductionItemDataChanged");
             hookNamed(loader, "com.oplus.melody.btsdk.multidevice.HeadsetCoreService", "u", 2, "connectToDevice");
             hookNamed(loader, "com.oplus.melody.btsdk.multidevice.HeadsetCoreService", "v", 1, "connectImmediate");
@@ -170,8 +157,13 @@ public final class ObserverModule extends XposedModule {
             hookNamed(loader, "com.oplus.melody.model.repository.earphone.U", "s0", 2, "noiseModeWrite");
             hookNamed(loader, "com.oplus.melody.model.repository.earphone.EarphoneRepositoryClientImpl", "s0", 2, "noiseModeWriteClient");
             hookNamed(loader, "com.oplus.melody.model.repository.earphone.EarphoneRepositoryClientImpl", "z", 1, "repositoryClientObserve");
+            hookNamed(loader, "V7.v", "g", 0, "melodyEarphoneLiveDataRequest");
+            hookNamed(loader, "V7.u", "handleMessage", 1, "melodyEarphoneLiveDataResponse");
             hookNamed(loader, "com.oplus.melody.model.repository.earphone.U", "k1", 1, "stateCallback");
             hookNamed(loader, "com.oplus.melody.model.repository.earphone.U", "x1", 1, "repositoryNotify");
+            hookNamed(loader, "com.oplus.melody.ui.component.detail.opsreduction.OpsReductionItem", "onBindViewHolder", 1, "opsReductionItemBound");
+            hookNamed(loader, "com.oplus.melody.ui.component.detail.opsreduction.buttonseekbar.NoiseReductionButtonSeekBarView", "h", 0, "opsReductionSwitchToCurrentMode");
+            hookNamed(loader, "com.oplus.melody.ui.component.detail.opsreduction.buttonseekbar.NoiseReductionButtonSeekBarView", "i", 0, "opsReductionUpdateActionView");
             if (!isPrimaryProcess()) startForegroundStateWatcher();
         } catch (Throwable t) {
             log(Log.ERROR, TAG, "observer setup failed", t);
@@ -204,27 +196,49 @@ public final class ObserverModule extends XposedModule {
                 return;
             }
             Method method = selected;
-            if ("noiseReductionItemDataChanged".equals(label)) {
-                noiseReductionItemUpdateMethod = method;
-            }
             hook(method)
                     .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
                     .intercept(chain -> {
+                boolean melodyEarphoneLiveData = isMelodyEarphoneLiveData(chain.getThisObject());
                 boolean traceCall = shouldTrace(label, chain, arity);
+                if ("melodyEarphoneLiveDataRequest".equals(label)
+                        || "melodyEarphoneLiveDataResponse".equals(label)) {
+                    traceCall = melodyEarphoneLiveData;
+                }
                 if (traceCall) {
                     log(Log.INFO, TAG, event(label + " before " + signature(method) + " args=" + describeArgs(chain, arity)));
                 }
                 try {
                     captureRepository(label, chain);
-                    if ("noiseReductionObserverItem".equals(label)) {
-                        rememberNoiseReductionObserverItem(chain.getThisObject());
+                    if ("noiseReductionItemDataChanged".equals(label)) {
+                        Object result = chain.proceed();
+                        log(Log.INFO, TAG, event("Melody native ANC LiveData callback completed"));
+                        return result;
+                    }
+                    if ("repositoryDtoBuild".equals(label)) {
+                        Object result = chain.proceed();
+                        projectSonyAncModeIntoDto(chain.getArg(0), result);
+                        return result;
+                    }
+                    if ("melodyEarphoneLiveDataResponse".equals(label)
+                            && melodyEarphoneLiveData) {
+                        log(Log.INFO, TAG, event("Melody foreground ANC LiveData response dispatching"));
+                        Object result = chain.proceed();
+                        Object value = readLiveDataValue(chain.getThisObject());
+                        log(Log.INFO, TAG, event("Melody foreground ANC LiveData response published value="
+                                + describe(value)));
+                        return result;
+                    }
+                    if ("melodyEarphoneLiveDataRequest".equals(label)
+                            && melodyEarphoneLiveData) {
+                        log(Log.INFO, TAG, event("Melody foreground ANC LiveData request dispatching"));
                         return chain.proceed();
                     }
-                    if ("noiseReductionItemAttached".equals(label)
-                            || "noiseReductionItemBound".equals(label)
-                            || "noiseReductionItemDataChanged".equals(label)) {
+                    if ("opsReductionItemBound".equals(label)
+                            || "opsReductionSwitchToCurrentMode".equals(label)
+                            || "opsReductionUpdateActionView".equals(label)) {
                         Object result = chain.proceed();
-                        rememberNoiseReductionItem(chain.getThisObject());
+                        log(Log.INFO, TAG, event("Melody OPS ANC UI " + label + " completed"));
                         return result;
                     }
                     if ("nativeConnectDevice".equals(label) && isTargetDeviceInfo(chain.getArg(0))) {
@@ -675,109 +689,9 @@ public final class ObserverModule extends XposedModule {
         if (state != null) {
             rememberTargetAddress(state.address);
         }
+        log(Log.INFO, TAG, event("foreground Sony state changed; requesting native Melody LiveData refresh"
+                + " mode=" + (state == null ? -1 : state.modeIndex)));
         refreshTargetRepository("foreground shared Sony state changed");
-        scheduleNoiseReductionItemRefresh("foreground shared Sony state changed");
-    }
-
-    private void rememberNoiseReductionItem(Object item) {
-        if (item == null) return;
-        boolean target = isTargetNoiseReductionItem(item);
-        boolean firstObservation;
-        synchronized (targetNoiseReductionItems) {
-            firstObservation = !targetNoiseReductionItems.containsKey(item);
-            targetNoiseReductionItems.put(item, Boolean.TRUE);
-        }
-        if (firstObservation) {
-            Object viewModel = readField(item, "mViewModel");
-            Object address = readField(viewModel, "f20659b");
-            String addressHash = address instanceof String
-                    ? Integer.toHexString(address.hashCode()) : "none";
-            log(Log.INFO, TAG, event("captured detail noise reduction item target=" + target
-                    + " addressHash=" + addressHash));
-        }
-        if (target) {
-            scheduleNoiseReductionItemRefresh("detail item observed");
-        }
-    }
-
-    private void rememberNoiseReductionObserverItem(Object observer) {
-        Object item = readField(observer, "f19973b");
-        if (item != null && item.getClass().getName().equals(
-                "com.oplus.melody.ui.component.detail.noisereduction.NoiseReductionItem")) {
-            rememberNoiseReductionItem(item);
-        }
-    }
-
-    private boolean isTargetNoiseReductionItem(Object item) {
-        if (item == null) return false;
-        Object viewModel = readField(item, "mViewModel");
-        Object address = readField(viewModel, "f20659b");
-        return isTargetAddress(address);
-    }
-
-    private void scheduleNoiseReductionItemRefresh(String reason) {
-        try {
-            Handler handler = mainHandler;
-            if (handler == null) {
-                synchronized (this) {
-                    handler = mainHandler;
-                    if (handler == null) {
-                        handler = new Handler(Looper.getMainLooper());
-                        mainHandler = handler;
-                    }
-                }
-            }
-            Handler targetHandler = handler;
-            targetHandler.post(() -> refreshNoiseReductionItems(reason));
-        } catch (Throwable t) {
-            log(Log.WARN, TAG, "cannot schedule Sony detail ANC refresh", t);
-        }
-    }
-
-    private void refreshNoiseReductionItems(String reason) {
-        SharedSonyState state = readSharedSonyState();
-        int mode = state == null ? -1 : state.modeIndex;
-        if (mode < 0) return;
-
-        List<Object> items;
-        synchronized (targetNoiseReductionItems) {
-            items = new ArrayList<>(targetNoiseReductionItems.keySet());
-        }
-        if (items.isEmpty()) {
-            log(Log.WARN, TAG, event("Sony detail ANC refresh has no captured NoiseReductionItem (" + reason + ")"));
-        }
-        for (Object item : items) {
-            if (!isTargetNoiseReductionItem(item)) continue;
-            Object noiseReductionVo = readField(item, "mNoiseReductionVO");
-            if (noiseReductionVo == null) {
-                log(Log.WARN, TAG, event("Sony detail ANC refresh found item without NoiseReductionVO"));
-                continue;
-            }
-            Object current = readField(noiseReductionVo, "mCurrentNoiseReductionModeIndex");
-            if (current instanceof Number && ((Number) current).intValue() == mode) continue;
-            if (!writeField(noiseReductionVo, "mCurrentNoiseReductionModeIndex", mode)) {
-                log(Log.WARN, TAG, event("cannot update Sony detail ANC VO mode"));
-                continue;
-            }
-            invokeNoiseReductionItemUpdate(item, noiseReductionVo, mode, reason);
-        }
-    }
-
-    private void invokeNoiseReductionItemUpdate(Object item, Object noiseReductionVo,
-            int mode, String reason) {
-        Method method = noiseReductionItemUpdateMethod;
-        if (method == null) {
-            method = findMethod(item.getClass(), "onEarphoneDataChanged", 1);
-        }
-        if (method == null) return;
-        try {
-            method.setAccessible(true);
-            method.invoke(item, noiseReductionVo);
-            log(Log.INFO, TAG, event("refreshed Sony detail ANC button mode=" + mode
-                    + " (" + reason + ")"));
-        } catch (Throwable t) {
-            log(Log.WARN, TAG, "Sony detail ANC callback failed", t);
-        }
     }
 
     private void refreshTargetRepository(String reason) {
@@ -797,14 +711,16 @@ public final class ObserverModule extends XposedModule {
                     Method activate = liveData.getClass().getMethod("g");
                     activate.setAccessible(true);
                     activate.invoke(liveData);
-                    log(Log.INFO, TAG, event("requested Melody provider refresh for WF-1000XM3 (" + reason + ")"));
+                    log(Log.INFO, TAG, event("requested native Melody foreground LiveData reload"
+                            + " for WF-1000XM3 (" + reason + ")"));
                     return;
                 }
             }
             Method notifyChanged = repository.getClass().getDeclaredMethod("x1", String.class);
             notifyChanged.setAccessible(true);
             notifyChanged.invoke(repository, address);
-            log(Log.INFO, TAG, event("requested Melody repository refresh for WF-1000XM3 (" + reason + ")"));
+            log(Log.INFO, TAG, event("published native Melody repository update for WF-1000XM3"
+                    + " (" + reason + ")"));
         } catch (Throwable t) {
             log(Log.WARN, TAG, "Melody repository refresh failed", t);
         }
@@ -838,29 +754,40 @@ public final class ObserverModule extends XposedModule {
         return null;
     }
 
-    private static Method findMethod(Class<?> type, String methodName, int arity) {
-        Class<?> current = type;
-        while (current != null) {
-            for (Method method : current.getDeclaredMethods()) {
-                if (method.getName().equals(methodName)
-                        && method.getParameterTypes().length == arity) {
-                    return method;
-                }
-            }
-            current = current.getSuperclass();
+    private void projectSonyAncModeIntoDto(Object address, Object dto) {
+        if (!isTargetAddress(address) || dto == null) return;
+
+        int mode = sonyState == null
+                ? readSharedSonyModeIndex()
+                : SonyModeMapper.toMelodyIndex(sonyState.getMode());
+        if (mode < 0) {
+            log(Log.WARN, TAG, event("Melody DTO ANC projection skipped: Sony mode unavailable"));
+            return;
         }
-        return null;
+
+        Object previous = readField(dto, "noiseReductionModeIndex");
+        if (previous instanceof Number && ((Number) previous).intValue() == mode) {
+            log(Log.INFO, TAG, event("Melody DTO ANC projection unchanged mode=" + mode));
+            return;
+        }
+        if (writeIntField(dto, "noiseReductionModeIndex", mode)) {
+            log(Log.INFO, TAG, event("projected Sony ANC mode into Melody EarphoneDTO old="
+                    + compact(previous) + " new=" + mode));
+        } else {
+            log(Log.WARN, TAG, event("Melody DTO ANC projection failed old="
+                    + compact(previous) + " requested=" + mode));
+        }
     }
 
-    private static boolean writeField(Object object, String fieldName, int value) {
+    private static boolean writeIntField(Object object, String fieldName, int value) {
         if (object == null) return false;
         Class<?> type = object.getClass();
         while (type != null) {
             try {
                 Field field = type.getDeclaredField(fieldName);
                 field.setAccessible(true);
-                field.set(object, value);
-                return true;
+                field.setInt(object, value);
+                return field.getInt(object) == value;
             } catch (NoSuchFieldException ignored) {
                 type = type.getSuperclass();
             } catch (Throwable ignored) {
@@ -868,6 +795,21 @@ public final class ObserverModule extends XposedModule {
             }
         }
         return false;
+    }
+
+    private static boolean isMelodyEarphoneLiveData(Object value) {
+        Object liveData = value;
+        Object requestCode = readField(liveData, "l");
+        if (!(requestCode instanceof Number)) {
+            liveData = readField(value, "b");
+            requestCode = readField(liveData, "l");
+        }
+        return requestCode instanceof Number && ((Number) requestCode).intValue() == 0xBDD;
+    }
+
+    private static Object readLiveDataValue(Object callback) {
+        Object liveData = readField(callback, "b");
+        return readField(liveData, "p");
     }
 
     private static String compact(Object value) {
