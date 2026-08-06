@@ -6,6 +6,8 @@ import android.app.Activity;
 import android.app.Application;
 import android.content.pm.ApplicationInfo;
 import android.content.res.AssetManager;
+import android.os.Handler;
+import android.os.Looper;
 import android.util.Log;
 import android.view.View;
 import android.view.ViewGroup;
@@ -61,6 +63,9 @@ public final class HookModule extends XposedModule {
     private volatile String lastSonyCommandFingerprint;
     private volatile String lastSonyBatteryCommandNonce;
     private volatile boolean sonyConfigInitialized;
+    private volatile boolean activityLifecycleRegistered;
+    private volatile int startedActivityCount;
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final ThreadLocal<Boolean> detailAncWriteObserved = new ThreadLocal<>();
     private final SonyTransportAdapter sonyTransport = new SonyTransportAdapter(new SonyTransportAdapter.Listener() {
         @Override
@@ -142,9 +147,14 @@ public final class HookModule extends XposedModule {
         try {
             initializeSonyConfig();
             if (isPrimaryProcess()) {
-                clearSharedSonyState();
+                clearStaleSharedSonyState();
                 clearSharedSonyCommand();
                 clearSharedSonyBatteryCommand();
+                registerAppVisibilityLifecycleCallbacks();
+                if (sonyTransport.isConnected()) {
+                    writeSharedSonyState();
+                    log(Log.INFO, TAG, event("republished live Sony session after package initialization"));
+                }
             }
             ClassLoader loader = param.getClassLoader();
             melodyClassLoader = loader;
@@ -871,8 +881,26 @@ public final class HookModule extends XposedModule {
         String content = targetAddress + "\n" + android.os.Process.myPid() + "\n" + mode + "\n";
         try (FileOutputStream output = new FileOutputStream(file, false)) {
             output.write(content.getBytes(StandardCharsets.US_ASCII));
+            log(Log.INFO, TAG, event("shared Sony state published addressHash="
+                    + Integer.toHexString(targetAddress.hashCode()) + " mode=" + mode));
         } catch (Throwable t) {
             log(Log.WARN, TAG, "shared Sony state write failed", t);
+        }
+    }
+
+    /** Removes only a malformed or dead-process marker; live sessions must survive hook re-entry. */
+    private void clearStaleSharedSonyState() {
+        if (!isPrimaryProcess()) return;
+        File file = sharedStateFile();
+        if (file == null || !file.isFile()) return;
+        if (readSharedSonyState() != null) {
+            log(Log.INFO, TAG, event("preserved live shared Sony state during package initialization"));
+            return;
+        }
+        if (!file.delete()) {
+            log(Log.WARN, TAG, "stale shared Sony state delete failed");
+        } else {
+            log(Log.INFO, TAG, event("cleared stale shared Sony state during package initialization"));
         }
     }
 
@@ -894,6 +922,59 @@ public final class HookModule extends XposedModule {
         } catch (Throwable t) {
             log(Log.WARN, TAG, "shared Sony ANC command write failed", t);
             return false;
+        }
+    }
+
+    private void registerAppVisibilityLifecycleCallbacks() {
+        if (activityLifecycleRegistered) return;
+        Application application = currentApplication();
+        if (application == null) {
+            log(Log.WARN, TAG, event("Melody activity lifecycle observer unavailable: application is null"));
+            return;
+        }
+        synchronized (this) {
+            if (activityLifecycleRegistered) return;
+            application.registerActivityLifecycleCallbacks(new Application.ActivityLifecycleCallbacks() {
+                @Override
+                public void onActivityCreated(Activity activity, android.os.Bundle state) {
+                }
+
+                @Override
+                public void onActivityStarted(Activity activity) {
+                    startedActivityCount++;
+                }
+
+                @Override
+                public void onActivityResumed(Activity activity) {
+                }
+
+                @Override
+                public void onActivityPaused(Activity activity) {
+                }
+
+                @Override
+                public void onActivityStopped(Activity activity) {
+                    startedActivityCount = Math.max(0, startedActivityCount - 1);
+                    if (startedActivityCount != 0 || activity.isChangingConfigurations()) return;
+                    mainHandler.postDelayed(() -> {
+                        if (startedActivityCount != 0 || targetAddress == null) return;
+                        log(Log.INFO, TAG, event("Melody left foreground; releasing Sony RFCOMM session"));
+                        clearSharedSonyCommand();
+                        clearSharedSonyBatteryCommand();
+                        sonyTransport.disconnect();
+                    }, 400L);
+                }
+
+                @Override
+                public void onActivitySaveInstanceState(Activity activity, android.os.Bundle state) {
+                }
+
+                @Override
+                public void onActivityDestroyed(Activity activity) {
+                }
+            });
+            activityLifecycleRegistered = true;
+            log(Log.INFO, TAG, event("registered Melody app visibility lifecycle observer"));
         }
     }
 
