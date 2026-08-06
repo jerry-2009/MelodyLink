@@ -1,6 +1,7 @@
 package com.melody.melodylink.hook;
 
 import android.bluetooth.BluetoothDevice;
+import android.bluetooth.BluetoothAdapter;
 import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.app.Application;
@@ -53,16 +54,20 @@ public final class HookModule extends XposedModule {
     private static final int WF_1000XM3_PRODUCT_ID = 0x067410;
     private volatile int targetAddressHash;
     private volatile String targetAddress;
+    private volatile BluetoothDevice targetSonyDevice;
     private volatile Object earphoneRepository;
     private volatile SonyAncState sonyState;
     private volatile SonyBatteryState sonyBatteryState;
     private volatile ClassLoader melodyClassLoader;
     private volatile CompletableFuture<Object> pendingNoiseWrite;
+    private volatile SonyAncMode pendingAncMode;
+    private volatile boolean pendingBatteryRefresh;
     private volatile ScheduledExecutorService foregroundStateWatcher;
     private volatile String lastForegroundStateFingerprint;
     private volatile String lastSonyCommandFingerprint;
     private volatile String lastSonyBatteryCommandNonce;
     private volatile boolean sonyConfigInitialized;
+    private volatile boolean retainSharedSonyStateAfterCommandDisconnect;
     private volatile boolean activityLifecycleRegistered;
     private volatile int startedActivityCount;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
@@ -80,6 +85,7 @@ public final class HookModule extends XposedModule {
             log(Log.INFO, TAG, event("Sony RFCOMM connected; ANC state=" + state.getMode()));
             publishSonyBatteryState("Sony connected");
             refreshTargetRepository("Sony connected");
+            runPendingSonyOperation();
         }
 
         @Override
@@ -116,8 +122,20 @@ public final class HookModule extends XposedModule {
         }
 
         @Override
+        public void onCommandSessionFinished(String reason) {
+            retainSharedSonyStateAfterCommandDisconnect = true;
+            log(Log.INFO, TAG, event("Sony RFCOMM command succeeded; retaining device state while closing session: "
+                    + reason));
+        }
+
+        @Override
         public void onDisconnected() {
             failPendingNoiseWrite("Sony transport disconnected");
+            if (retainSharedSonyStateAfterCommandDisconnect) {
+                retainSharedSonyStateAfterCommandDisconnect = false;
+                log(Log.INFO, TAG, event("Sony RFCOMM released after successful command; device state retained"));
+                return;
+            }
             sonyState = null;
             sonyBatteryState = null;
             clearSharedSonyState();
@@ -128,6 +146,8 @@ public final class HookModule extends XposedModule {
         @Override
         public void onFailed(String reason) {
             failPendingNoiseWrite(reason);
+            pendingAncMode = null;
+            pendingBatteryRefresh = false;
             sonyState = null;
             sonyBatteryState = null;
             clearSharedSonyState();
@@ -344,7 +364,7 @@ public final class HookModule extends XposedModule {
                                 return chain.proceed();
                             }
                         } else {
-                            sonyTransport.disconnect();
+                            releaseSonySession("Melody requested Sony disconnect");
                         }
                         log(Log.WARN, TAG, event("bypassed OPPO m_spp_le for registered Sony device"));
                         return null;
@@ -488,6 +508,14 @@ public final class HookModule extends XposedModule {
                 return false;
             }
             rememberTargetAddress(bluetoothAddress);
+            targetSonyDevice = (BluetoothDevice) device;
+            // The adapter suppresses duplicate connects. Re-publish here so :fg can recover
+            // a live session whose marker was lost before this repeated native connection call.
+            if (sonyTransport.isConnected()) {
+                writeSharedSonyState();
+                log(Log.INFO, TAG, event("republished existing Sony RFCOMM session addressHash="
+                        + Integer.toHexString(bluetoothAddress.hashCode())));
+            }
             log(Log.INFO, TAG, event("starting Sony session name=" + ((BluetoothDevice) device).getName()
                     + " addressHash=" + Integer.toHexString(bluetoothAddress.hashCode())));
             sonyTransport.connect((BluetoothDevice) device);
@@ -561,10 +589,6 @@ public final class HookModule extends XposedModule {
             future.completeExceptionally(new IllegalArgumentException("unsupported Sony ANC mode index"));
             return future;
         }
-        if (!sonyTransport.isConnected()) {
-            future.completeExceptionally(new IllegalStateException("Sony transport is not connected"));
-            return future;
-        }
         synchronized (this) {
             CompletableFuture<Object> previous = pendingNoiseWrite;
             if (previous != null && !previous.isDone()) {
@@ -572,8 +596,15 @@ public final class HookModule extends XposedModule {
             }
             melodyClassLoader = loader;
             pendingNoiseWrite = future;
+            pendingAncMode = mode;
+            pendingBatteryRefresh = false;
         }
-        sonyTransport.setAncMode(mode, 10, false);
+        if (sonyTransport.isConnected()) {
+            runPendingSonyOperation();
+        } else if (!connectTargetSonyTransport("ANC command")) {
+            pendingAncMode = null;
+            failPendingNoiseWrite("Sony ANC command cannot start: target Bluetooth device is unavailable");
+        }
         return future;
     }
 
@@ -888,12 +919,13 @@ public final class HookModule extends XposedModule {
         }
     }
 
-    /** Removes only a malformed or dead-process marker; live sessions must survive hook re-entry. */
+    /** Removes malformed or previous-process markers while retaining a live hook re-entry marker. */
     private void clearStaleSharedSonyState() {
         if (!isPrimaryProcess()) return;
         File file = sharedStateFile();
         if (file == null || !file.isFile()) return;
-        if (readSharedSonyState() != null) {
+        SharedSonyState state = readSharedSonyState();
+        if (state != null && state.ownerPid == android.os.Process.myPid()) {
             log(Log.INFO, TAG, event("preserved live shared Sony state during package initialization"));
             return;
         }
@@ -923,6 +955,21 @@ public final class HookModule extends XposedModule {
             log(Log.WARN, TAG, "shared Sony ANC command write failed", t);
             return false;
         }
+    }
+
+    private void releaseSonySession(String reason) {
+        retainSharedSonyStateAfterCommandDisconnect = false;
+        pendingAncMode = null;
+        pendingBatteryRefresh = false;
+        failPendingNoiseWrite(reason);
+        sonyState = null;
+        sonyBatteryState = null;
+        clearSharedSonyState();
+        clearSharedSonyCommand();
+        clearSharedSonyBatteryCommand();
+        log(Log.INFO, TAG, event(reason + "; releasing Sony RFCOMM session"));
+        sonyTransport.disconnect();
+        refreshTargetRepository(reason);
     }
 
     private void registerAppVisibilityLifecycleCallbacks() {
@@ -958,10 +1005,7 @@ public final class HookModule extends XposedModule {
                     if (startedActivityCount != 0 || activity.isChangingConfigurations()) return;
                     mainHandler.postDelayed(() -> {
                         if (startedActivityCount != 0 || targetAddress == null) return;
-                        log(Log.INFO, TAG, event("Melody left foreground; releasing Sony RFCOMM session"));
-                        clearSharedSonyCommand();
-                        clearSharedSonyBatteryCommand();
-                        sonyTransport.disconnect();
+                        releaseSonySession("Melody left foreground");
                     }, 400L);
                 }
 
@@ -994,10 +1038,61 @@ public final class HookModule extends XposedModule {
         if (address == null) address = readSharedSonyAddress();
         if (!isTargetAddress(address)) return;
         if (isPrimaryProcess()) {
-            sonyTransport.refreshBattery();
+            if (sonyTransport.isConnected()) {
+                sonyTransport.refreshBattery();
+            } else {
+                pendingBatteryRefresh = true;
+                if (!connectTargetSonyTransport("battery refresh")) {
+                    pendingBatteryRefresh = false;
+                    log(Log.WARN, TAG, event("Sony battery refresh skipped: target Bluetooth device is unavailable"));
+                }
+            }
             return;
         }
         writeSharedSonyBatteryCommand(address);
+    }
+
+    @SuppressLint("MissingPermission")
+    private boolean connectTargetSonyTransport(String reason) {
+        BluetoothDevice device = resolveTargetSonyDevice();
+        if (device == null) return false;
+        log(Log.INFO, TAG, event("opening temporary Sony RFCOMM session for " + reason
+                + " addressHash=" + Integer.toHexString(device.getAddress().hashCode())));
+        sonyTransport.connect(device);
+        return true;
+    }
+
+    @SuppressLint("MissingPermission")
+    private BluetoothDevice resolveTargetSonyDevice() {
+        BluetoothDevice remembered = targetSonyDevice;
+        if (remembered != null && isTargetDevice(remembered)) return remembered;
+        String address = targetAddress;
+        if (address == null) return null;
+        try {
+            BluetoothAdapter adapter = BluetoothAdapter.getDefaultAdapter();
+            if (adapter == null) return null;
+            BluetoothDevice device = adapter.getRemoteDevice(address);
+            if (!isTargetDevice(device)) return null;
+            targetSonyDevice = device;
+            return device;
+        } catch (IllegalArgumentException | SecurityException ignored) {
+            return null;
+        }
+    }
+
+    private void runPendingSonyOperation() {
+        SonyAncMode mode = pendingAncMode;
+        if (mode != null) {
+            pendingAncMode = null;
+            log(Log.INFO, TAG, event("sending queued Sony ANC command after temporary connection"));
+            sonyTransport.setAncMode(mode, 10, false);
+            return;
+        }
+        if (pendingBatteryRefresh) {
+            pendingBatteryRefresh = false;
+            log(Log.INFO, TAG, event("sending queued Sony battery refresh after temporary connection"));
+            sonyTransport.refreshBattery();
+        }
     }
 
     private boolean writeSharedSonyBatteryCommand(String address) {
@@ -1069,9 +1164,8 @@ public final class HookModule extends XposedModule {
             String[] lines = new String(buffer, 0, count, StandardCharsets.US_ASCII).split("\\r?\\n");
             if (lines.length < 2) return null;
             int pid = Integer.parseInt(lines[1].trim());
-            if (!new File("/proc/" + pid + "/cmdline").isFile()) return null;
             int modeIndex = lines.length >= 3 ? Integer.parseInt(lines[2].trim()) : -1;
-            return new SharedSonyState(lines[0].trim(), modeIndex);
+            return new SharedSonyState(lines[0].trim(), pid, modeIndex);
         } catch (Throwable ignored) {
             return null;
         }
@@ -1079,10 +1173,12 @@ public final class HookModule extends XposedModule {
 
     private static final class SharedSonyState {
         final String address;
+        final int ownerPid;
         final int modeIndex;
 
-        SharedSonyState(String address, int modeIndex) {
+        SharedSonyState(String address, int ownerPid, int modeIndex) {
             this.address = address;
+            this.ownerPid = ownerPid;
             this.modeIndex = modeIndex;
         }
     }

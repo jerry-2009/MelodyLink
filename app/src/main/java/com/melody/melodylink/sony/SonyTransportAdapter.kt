@@ -36,6 +36,7 @@ class SonyTransportAdapter @JvmOverloads constructor(
         fun onConnected(state: SonyAncState)
         fun onBatteryState(state: SonyBatteryState)
         fun onAncWriteResult(success: Boolean, state: SonyAncState?, reason: String)
+        fun onCommandSessionFinished(reason: String)
         fun onDisconnected()
         fun onFailed(reason: String)
         fun onLog(message: String)
@@ -247,6 +248,7 @@ class SonyTransportAdapter @JvmOverloads constructor(
                 } else {
                     currentState = state
                     listener.onAncWriteResult(true, state, "")
+                    disconnectAfterCommand("ANC command acknowledged")
                 }
             } catch (throwable: Throwable) {
                 listener.onLog("Sony ANC write failed: ${throwable.javaClass.simpleName}")
@@ -268,6 +270,7 @@ class SonyTransportAdapter @JvmOverloads constructor(
                 if (state != null && request == generation.get()) {
                     currentBatteryState = state
                     listener.onBatteryState(state)
+                    disconnectAfterCommand("battery command completed")
                 } else if (state == null) {
                     listener.onLog("Sony battery refresh returned no confirmed values")
                 }
@@ -275,6 +278,12 @@ class SonyTransportAdapter @JvmOverloads constructor(
                 listener.onLog("Sony battery refresh failed: ${throwable.javaClass.simpleName}")
             }
         }
+    }
+
+    private fun disconnectAfterCommand(reason: String) {
+        listener.onLog("Sony RFCOMM closing after successful $reason")
+        listener.onCommandSessionFinished(reason)
+        disconnect()
     }
 
     @SuppressLint("MissingPermission")
