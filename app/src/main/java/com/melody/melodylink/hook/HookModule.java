@@ -192,6 +192,7 @@ public final class HookModule extends XposedModule {
             hookNamed(loader, "com.oplus.melody.ui.component.detail.DetailMainViewModel", "f", 1, "detailState");
             hookNamed(loader, "com.oplus.melody.ui.component.detail.DetailMainViewModel", "g", 1, "detailConnectionState");
             hookNamed(loader, "com.oplus.melody.ui.component.detail.DetailMainActivity", "onCreate", 1, "detailActivityCreate");
+            hookNamed(loader, "androidx.preference.PreferenceGroup", "f", 1, "detailPreferenceAdd");
             hookNamed(loader, "com.oplus.melody.model.repository.earphone.U", "z", 1, "repositoryObserve");
             hookNamed(loader, "com.oplus.melody.model.repository.earphone.U", "y", 1, "repositoryGet");
             hookNamed(loader, "com.oplus.melody.model.repository.earphone.U", "g1", 1, "repositoryDtoBuild");
@@ -279,6 +280,12 @@ public final class HookModule extends XposedModule {
                 }
                 try {
                     captureRepository(label, chain);
+                    if ("detailPreferenceAdd".equals(label)) {
+                        Object preference = chain.getArg(0);
+                        Object result = chain.proceed();
+                        removeUnsupportedDetailCategory(preference);
+                        return result;
+                    }
                     if ("detailActivityCreate".equals(label)) {
                         Object result = chain.proceed();
                         if (chain.getThisObject() instanceof Activity) {
@@ -638,6 +645,29 @@ public final class HookModule extends XposedModule {
         View root = activity.getWindow().getDecorView();
         root.postDelayed(() -> installCustomAncControls(activity, loader), 750L);
         root.postDelayed(() -> installCustomAncControls(activity, loader), 2_000L);
+    }
+
+    private void removeUnsupportedDetailCategory(Object preference) {
+        if (preference == null) return;
+        try {
+            Method getTitle = preference.getClass().getMethod("getTitle");
+            Object title = getTitle.invoke(preference);
+            if (!DetailSectionFilter.shouldSuppressCategory(
+                    preference.getClass().getName(),
+                    title instanceof CharSequence ? (CharSequence) title : null)) {
+                return;
+            }
+            Method getParent = preference.getClass().getMethod("getParent");
+            Object parent = getParent.invoke(preference);
+            if (parent == null) return;
+            ClassLoader loader = preference.getClass().getClassLoader();
+            Class<?> preferenceType = Class.forName("androidx.preference.Preference", false, loader);
+            Method remove = parent.getClass().getMethod("j", preferenceType);
+            remove.invoke(parent, preference);
+            log(Log.INFO, TAG, event("removed unsupported Oppo-only detail category from PreferenceGroup"));
+        } catch (Throwable t) {
+            log(Log.WARN, TAG, "native detail category removal failed", t);
+        }
     }
 
     private void installCustomAncControls(Activity activity, ClassLoader loader) {
