@@ -16,6 +16,9 @@ class SonyConfigLoaderTest {
 
         assertTrue(result.issues.joinToString("\n") { "${it.path}: ${it.message}" }, result.issues.isEmpty())
         assertEquals(22, result.registry.profiles.size)
+        result.registry.profiles.forEach { profile ->
+            assertTrue(profile.image, File(mainAssetsDirectory(), profile.image!!).isFile)
+        }
     }
 }
 
@@ -115,6 +118,7 @@ private fun validProfileJson(
       "name": "$name",
       "family": "TEST",
       "modelType": "TWS",
+      "image": "sony/images/test.png",
       "match": {"exactNames": ["$name"], "namePatterns": [], "modaliasPrefixes": [], "deviceInfoModels": []},
       "protocol": {"versions": ["V2"], "preferredVersion": "V2", "rfcommUuids": {"V2": "956c7b26-d49a-4ba8-b03f-b17d393cb6e2"}, "handshakeRequired": true, "defaultV1AsmType": null, "defaultV2AsmType": 23},
       "battery": {"layout": "LEFT_RIGHT", "supportsChargingState": true},

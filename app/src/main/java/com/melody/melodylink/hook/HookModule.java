@@ -7,6 +7,7 @@ import android.app.Activity;
 import android.app.Application;
 import android.content.pm.ApplicationInfo;
 import android.content.res.AssetManager;
+import android.net.Uri;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
@@ -14,12 +15,16 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.widget.Button;
 import android.widget.LinearLayout;
+import android.widget.ImageView;
 
 import com.melody.melodylink.observer.MethodCallObserver;
 import com.melody.melodylink.sony.SonyTransportAdapter;
 import com.melody.melodylink.sony.config.SonyConfigIssue;
 import com.melody.melodylink.sony.config.SonyConfigLoadResult;
 import com.melody.melodylink.sony.config.SonyConfigLoader;
+import com.melody.melodylink.sony.config.SonyConfigRegistry;
+import com.melody.melodylink.sony.config.SonyDeviceConfig;
+import com.melody.melodylink.sony.config.DeviceIdentity;
 import com.op.bttest.sony.SonyAncMode;
 import com.op.bttest.sony.SonyAncState;
 import com.op.bttest.sony.SonyBattery;
@@ -67,6 +72,9 @@ public final class HookModule extends XposedModule {
     private volatile String lastSonyCommandFingerprint;
     private volatile String lastSonyBatteryCommandNonce;
     private volatile boolean sonyConfigInitialized;
+    private volatile SonyConfigRegistry sonyConfigRegistry;
+    private volatile AssetManager sonyModuleAssets;
+    private volatile SonyDeviceConfig activeSonyImageProfile;
     private volatile boolean retainSharedSonyStateAfterCommandDisconnect;
     private volatile boolean activityLifecycleRegistered;
     private volatile int startedActivityCount;
@@ -192,6 +200,13 @@ public final class HookModule extends XposedModule {
             hookNamed(loader, "com.oplus.melody.ui.component.detail.DetailMainViewModel", "f", 1, "detailState");
             hookNamed(loader, "com.oplus.melody.ui.component.detail.DetailMainViewModel", "g", 1, "detailConnectionState");
             hookNamed(loader, "com.oplus.melody.ui.component.detail.DetailMainActivity", "onCreate", 1, "detailActivityCreate");
+            hookNamed(loader, "com.oplus.melody.onespace.items.OneSpaceHeaderPreference", "i", 1, "sonyCardImage");
+            hookNamed(loader, "com.oplus.melody.onespace.items.OneSpaceHeaderPreference", "onBindViewHolder", 1, "sonyCardBind");
+            hookNamed(loader, "com.oplus.melody.onespace.items.OneSpaceHeaderPreference", "onShowAnimationEnd", 0, "sonyCardLoading");
+            hookNamed(loader, "com.oplus.melody.ui.widget.MelodyDetailModelView", "c", 1, "sonyDetailImage");
+            hookNamed(loader, "com.oplus.melody.ui.widget.MelodyDetailModelView", "d", 0, "sonyDetailPlaceholder");
+            hookNamed(loader, "com.oplus.melody.ui.widget.MelodyDetailModelView", "onFinishInflate", 0, "sonyDetailInflated");
+            hookNamed(loader, "com.oplus.melody.ui.widget.MelodyDetailModelView", "setViewModel", 1, "sonyDetailViewModel");
             hookNamed(loader, "androidx.preference.PreferenceGroup", "f", 1, "detailPreferenceAdd");
             hookNamed(loader, "com.oplus.melody.model.repository.earphone.U", "z", 1, "repositoryObserve");
             hookNamed(loader, "com.oplus.melody.model.repository.earphone.U", "y", 1, "repositoryGet");
@@ -280,6 +295,35 @@ public final class HookModule extends XposedModule {
                 }
                 try {
                     captureRepository(label, chain);
+                    if ("sonyCardImage".equals(label) && replaceSonyProductImage(
+                            chain.getThisObject(), "b", "c", "d", "e", "d", "card")) {
+                        return null;
+                    }
+                    if ("sonyDetailImage".equals(label) && replaceSonyProductImage(
+                            chain.getThisObject(), "g", "b", "c", "d", "e", "detail",
+                            findDetailImageView(chain.getThisObject()))) {
+                        return null;
+                    }
+                    if ("sonyDetailPlaceholder".equals(label) && replaceSonyProductImage(
+                            chain.getThisObject(), "g", "b", "c", "d", "e", "detail",
+                            findDetailImageView(chain.getThisObject()))) {
+                        return null;
+                    }
+                    if ("sonyDetailInflated".equals(label) || "sonyDetailViewModel".equals(label)) {
+                        Object result = chain.proceed();
+                        replaceSonyDetailImageLater(chain.getThisObject());
+                        return result;
+                    }
+                    if ("sonyCardBind".equals(label)) {
+                        Object result = chain.proceed();
+                        replaceSonyProductImage(chain.getThisObject(), "b", "c", "d", "e", "d",
+                                "card", findCardImageView(chain.getArg(0)));
+                        return result;
+                    }
+                    if ("sonyCardLoading".equals(label) && activeSonyImageProfile != null) {
+                        hideLoadingView(readField(chain.getThisObject(), "d"));
+                        return null;
+                    }
                     if ("detailPreferenceAdd".equals(label)) {
                         Object preference = chain.getArg(0);
                         Object result = chain.proceed();
@@ -399,6 +443,7 @@ public final class HookModule extends XposedModule {
                     Object deviceName = arity > 2 ? chain.getArg(2) : null;
                     if ("whitelist".equals(label) && deviceName instanceof String
                             && isRegisteredSonyName((String) deviceName)) {
+                        activeSonyImageProfile = findSonyProfileByName((String) deviceName);
                         Object profile = findProfile(chain.getArg(0), DeviceProfileMapper.SONY_TEST_PROFILE_ID, DeviceProfileMapper.SONY_TEST_PROFILE_NAME);
                         if (profile != null) {
                             log(Log.WARN, TAG, event("mapping registered Sony device " + deviceName
@@ -742,6 +787,8 @@ public final class HookModule extends XposedModule {
             }
             SonyConfigLoadResult result = SonyConfigLoader.INSTANCE.fromAssets(moduleAssets);
             sonyTransport.setConfigRegistry(result.getRegistry());
+            sonyConfigRegistry = result.getRegistry();
+            sonyModuleAssets = moduleAssets;
             for (SonyConfigIssue issue : result.getIssues()) {
                 log(Log.WARN, TAG, event("Sony configuration skipped " + issue.getPath()
                         + ": " + issue.getMessage()));
@@ -754,6 +801,147 @@ public final class HookModule extends XposedModule {
             log(Log.ERROR, TAG, "Sony configuration initialization failed", t);
             return false;
         }
+    }
+
+    /** Replaces only the two product-image views identified from Melody 16.8.3's resource flow. */
+    private boolean replaceSonyProductImage(
+            Object owner,
+            String viewModelField,
+            String addressField,
+            String nameField,
+            String imageField,
+            String loadingField,
+            String surface
+    ) {
+        return replaceSonyProductImage(owner, viewModelField, addressField, nameField,
+                imageField, loadingField, surface, null);
+    }
+
+    private boolean replaceSonyProductImage(
+            Object owner,
+            String viewModelField,
+            String addressField,
+            String nameField,
+            String imageField,
+            String loadingField,
+            String surface,
+            ImageView fallbackImageView
+    ) {
+        Object viewModel = readField(owner, viewModelField);
+        String address = asString(readField(viewModel, addressField));
+        String name = asString(readField(viewModel, nameField));
+        SonyDeviceConfig profile = findSonyImageProfile(address, name);
+        if (profile == null) {
+            log(Log.INFO, TAG, event("Sony " + surface + " image skipped: profile unavailable"
+                    + " viewModel=" + (viewModel != null)));
+            return false;
+        }
+
+        Object imageValue = readField(owner, imageField);
+        ImageView imageView = imageValue instanceof ImageView
+                ? (ImageView) imageValue : fallbackImageView;
+        if (imageView == null) {
+            log(Log.WARN, TAG, event("Sony " + surface + " image target unavailable"));
+            return false;
+        }
+        File imageFile = materializeSonyImage(profile);
+        if (imageFile == null) {
+            log(Log.WARN, TAG, event("Sony " + surface + " image skipped: asset unavailable profile="
+                    + profile.getId()));
+            return false;
+        }
+
+        imageView.setImageURI(Uri.fromFile(imageFile));
+        imageView.setVisibility(View.VISIBLE);
+        Object loadingView = readField(owner, loadingField);
+        hideLoadingView(loadingView);
+        log(Log.INFO, TAG, event("replaced Sony " + surface + " product image profile="
+                + profile.getId()));
+        return true;
+    }
+
+    private ImageView findCardImageView(Object holder) {
+        Object itemView = readField(holder, "itemView");
+        if (!(itemView instanceof View)) return null;
+        View root = (View) itemView;
+        int imageId = root.getResources().getIdentifier("device_image", "id", TARGET);
+        View image = imageId == 0 ? null : root.findViewById(imageId);
+        return image instanceof ImageView ? (ImageView) image : null;
+    }
+
+    private static void hideLoadingView(Object loadingView) {
+        if (loadingView == null) return;
+        try {
+            Method cancelAnimation = loadingView.getClass().getMethod("cancelAnimation");
+            cancelAnimation.invoke(loadingView);
+        } catch (Throwable ignored) {
+        }
+        if (loadingView instanceof View) ((View) loadingView).setVisibility(View.GONE);
+    }
+
+    private ImageView findDetailImageView(Object owner) {
+        if (!(owner instanceof View)) return null;
+        View root = (View) owner;
+        int imageId = root.getResources().getIdentifier("normal_image", "id", TARGET);
+        View image = imageId == 0 ? null : root.findViewById(imageId);
+        return image instanceof ImageView ? (ImageView) image : null;
+    }
+
+    private void replaceSonyDetailImageLater(Object owner) {
+        if (!(owner instanceof View)) return;
+        View view = (View) owner;
+        view.post(() -> replaceSonyProductImage(owner, "g", "b", "c", "d", "e", "detail",
+                findDetailImageView(owner)));
+    }
+
+    private SonyDeviceConfig findSonyImageProfile(String address, String name) {
+        SonyConfigRegistry registry = sonyConfigRegistry;
+        if (registry == null) return null;
+        SonyDeviceConfig profile = findSonyProfileByName(name);
+        if (profile == null) profile = activeSonyImageProfile;
+        if (profile == null || profile.getImage() == null || profile.getImage().trim().isEmpty()) return null;
+        // The whitelist hook has already verified this profile. The ViewModel is populated later.
+        if (address != null && isTargetAddress(address)) rememberTargetAddress(address);
+        return profile;
+    }
+
+    private SonyDeviceConfig findSonyProfileByName(String name) {
+        SonyConfigRegistry registry = sonyConfigRegistry;
+        if (registry == null || name == null || name.trim().isEmpty()) return null;
+        return registry.findBest(new DeviceIdentity(name, null, null, null));
+    }
+
+    private File materializeSonyImage(SonyDeviceConfig profile) {
+        Application application = currentApplication();
+        AssetManager assets = sonyModuleAssets;
+        String assetPath = profile.getImage();
+        if (application == null || assets == null || assetPath == null || !assetPath.startsWith("sony/images/")) {
+            return null;
+        }
+        String fileName = new File(assetPath).getName();
+        File directory = new File(application.getFilesDir(), "melodylink/sony-images");
+        File output = new File(directory, profile.getId().replace('.', '_') + "-" + fileName);
+        try {
+            if (output.isFile() && output.length() > 0L) return output;
+            if (!directory.isDirectory() && !directory.mkdirs()) {
+                log(Log.WARN, TAG, event("Sony image directory creation failed"));
+                return null;
+            }
+            try (java.io.InputStream input = assets.open(assetPath);
+                 FileOutputStream stream = new FileOutputStream(output, false)) {
+                byte[] buffer = new byte[8192];
+                int count;
+                while ((count = input.read(buffer)) != -1) stream.write(buffer, 0, count);
+            }
+            return output.isFile() && output.length() > 0L ? output : null;
+        } catch (Throwable t) {
+            log(Log.WARN, TAG, "Sony image materialization failed", t);
+            return null;
+        }
+    }
+
+    private static String asString(Object value) {
+        return value instanceof String ? (String) value : null;
     }
 
     private static View findViewByClassName(View view, String className) {

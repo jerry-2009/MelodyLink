@@ -117,6 +117,7 @@ object SonyConfigLoader {
             name = json.requiredString("name"),
             family = json.requiredString("family"),
             modelType = json.requiredString("modelType"),
+            image = json.optionalString("image"),
             match = SonyMatchRules(
                 exactNames = match.requiredStringList("exactNames"),
                 namePatterns = match.requiredStringList("namePatterns"),
@@ -168,6 +169,10 @@ object SonyConfigValidator {
         if (profile.schemaVersion != SONY_CONFIG_SCHEMA_VERSION) add("unsupported profile schema")
         if (!profile.id.matches(Regex("sony\\.[a-z0-9_]+"))) add("invalid profile id")
         if (profile.name.isBlank()) add("name must not be blank")
+        if (profile.image.isNullOrBlank()) add("image must not be blank")
+        if (profile.image != null && !profile.image.startsWith("sony/images/")) {
+            add("image must be a Sony image asset path")
+        }
         if (profile.match.exactNames.isEmpty() && profile.match.namePatterns.isEmpty()) {
             add("at least one name matcher is required")
         }
@@ -204,6 +209,9 @@ private fun JSONObject.optionalObject(name: String): JSONObject? =
 
 private fun JSONObject.requiredString(name: String): String =
     if (has(name) && !isNull(name)) getString(name) else error("missing string $name")
+
+private fun JSONObject.optionalString(name: String): String? =
+    if (has(name) && !isNull(name)) getString(name) else null
 
 private fun JSONObject.requiredInt(name: String): Int =
     if (has(name) && !isNull(name)) getInt(name) else error("missing integer $name")

@@ -84,6 +84,7 @@ data class SonyDeviceConfig(
     val name: String,
     val family: String,
     val modelType: String,
+    val image: String?,
     val match: SonyMatchRules,
     val protocol: SonyProtocolConfig,
     val battery: SonyBatteryConfig,
