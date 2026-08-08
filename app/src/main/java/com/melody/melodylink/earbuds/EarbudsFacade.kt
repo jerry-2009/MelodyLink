@@ -8,12 +8,15 @@ import com.melody.melodylink.domain.EarbudsCapabilities
 import com.melody.melodylink.domain.EarbudsState
 import com.melody.melodylink.domain.DeviceCatalog
 import com.melody.melodylink.domain.OperationResult
+import com.melody.melodylink.sony.config.SonyAdvancedSettingId
 
 interface EarbudsFacade {
     interface Listener {
         fun onConnecting()
         fun onConnected(state: EarbudsState)
         fun onBatteryState(state: EarbudsState)
+        fun onSettingState(id: SonyAdvancedSettingId, value: Boolean)
+        fun onSettingWriteResult(id: SonyAdvancedSettingId, success: Boolean, value: Boolean?, reason: String)
         fun onAncWriteResult(success: Boolean, state: EarbudsState?, reason: String)
         fun onCommandSessionFinished(reason: String)
         fun onDisconnected()
@@ -28,6 +31,8 @@ interface EarbudsFacade {
     fun disconnect()
     fun setAncMode(mode: AncMode)
     fun refreshBattery()
+    fun readSetting(id: SonyAdvancedSettingId)
+    fun writeSetting(id: SonyAdvancedSettingId, value: Boolean)
 }
 
 internal fun EarbudsCapabilities.withAncMode(mode: AncMode?): EarbudsState =

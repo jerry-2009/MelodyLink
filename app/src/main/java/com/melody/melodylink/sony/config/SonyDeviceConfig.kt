@@ -24,6 +24,21 @@ enum class SonyBatteryLayout {
     LEFT_RIGHT_CASE,
 }
 
+enum class SonyAdvancedSettingId {
+    DSEE,
+    PAUSE_WHEN_REMOVED,
+}
+
+enum class SonyAdvancedSettingType {
+    SWITCH,
+}
+
+data class SonyAdvancedSettingConfig(
+    val id: SonyAdvancedSettingId,
+    val type: SonyAdvancedSettingType,
+    val order: Int,
+)
+
 data class DeviceIdentity(
     val bluetoothName: String? = null,
     val modalias: String? = null,
@@ -92,6 +107,7 @@ data class SonyDeviceConfig(
     val controls: SonyControlConfig,
     val quirks: SonyQuirks,
     val supportLevel: SonySupportLevel,
+    val advancedSettings: List<SonyAdvancedSettingConfig> = emptyList(),
 ) {
     fun supportsAncMode(mode: SonyAncMode): Boolean = mode in capabilities.ancModes
 

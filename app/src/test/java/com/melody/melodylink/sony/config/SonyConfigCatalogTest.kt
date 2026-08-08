@@ -93,6 +93,26 @@ class SonyProfileMigrationTest {
         assertEquals(setOf(SonyAncMode.OFF, SonyAncMode.AMBIENT_SOUND), c510.capabilities.ancModes)
         assertTrue(xm3.supportLevel.permitsWrites)
         assertTrue(xm3.permitsAncWrites(SonyAncMode.NOISE_CANCELING))
+        assertTrue(xm3.advancedSettings.any { it.id == SonyAdvancedSettingId.DSEE })
+        assertTrue(xm3.advancedSettings.any { it.id == SonyAdvancedSettingId.PAUSE_WHEN_REMOVED })
+    }
+}
+
+class SonyAdvancedSettingsConfigTest {
+    @Test
+    fun rejectsDuplicateAndCapabilityMismatchedAdvancedSettings() {
+        val json = validProfileJson().replace(
+            "\"supportLevel\": \"READ_ONLY\"",
+            "\"advancedSettings\":[{\"id\":\"DSEE\",\"type\":\"SWITCH\",\"order\":10},{\"id\":\"DSEE\",\"type\":\"SWITCH\",\"order\":20}],\"supportLevel\": \"READ_ONLY\"",
+        )
+        val result = SonyConfigLoader.load(MapSonyAssetSource(mapOf(
+            "sony/registry.json" to "{\"schemaVersion\":1,\"devices\":[\"sony/config/test.json\"]}",
+            "sony/config/test.json" to json,
+        )))
+
+        assertTrue(result.registry.profiles.isEmpty())
+        assertTrue(result.issues.any { it.message == "duplicate advanced setting id" })
+        assertTrue(result.issues.any { it.message == "DSEE setting requires dsee capability" })
     }
 }
 

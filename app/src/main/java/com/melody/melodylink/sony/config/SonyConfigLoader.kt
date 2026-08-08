@@ -105,6 +105,7 @@ object SonyConfigLoader {
         val capabilities = json.requiredObject("capabilities")
         val controls = json.requiredObject("controls")
         val quirks = json.requiredObject("quirks")
+        val advancedSettings = json.optionalArray("advancedSettings")
         val ambientLevel = capabilities.optionalObject("ambientLevel")
         val uuidObject = protocol.requiredObject("rfcommUuids")
         val versions = protocol.requiredStringList("versions").map(SonyProtocolVersion::valueOf)
@@ -160,6 +161,15 @@ object SonyConfigLoader {
                 requiresAncReadAfterWrite = quirks.requiredBoolean("requiresAncReadAfterWrite"),
             ),
             supportLevel = SonySupportLevel.valueOf(json.requiredString("supportLevel")),
+            advancedSettings = advancedSettings?.advancedSettings()
+                ?: buildList {
+                    if (capabilities.requiredBoolean("dsee")) {
+                        add(SonyAdvancedSettingConfig(SonyAdvancedSettingId.DSEE, SonyAdvancedSettingType.SWITCH, 10))
+                    }
+                    if (controls.requiredBoolean("pauseWhenRemoved")) {
+                        add(SonyAdvancedSettingConfig(SonyAdvancedSettingId.PAUSE_WHEN_REMOVED, SonyAdvancedSettingType.SWITCH, 20))
+                    }
+                },
         )
     }
 }
@@ -198,6 +208,18 @@ object SonyConfigValidator {
         if (profile.capabilities.equalizerBands !in setOf(0, 6, 10)) {
             add("equalizer bands must be 0, 6, or 10")
         }
+        if (profile.advancedSettings.map { it.id }.distinct().size != profile.advancedSettings.size) {
+            add("duplicate advanced setting id")
+        }
+        profile.advancedSettings.forEach { setting ->
+            if (setting.type != SonyAdvancedSettingType.SWITCH) add("unsupported advanced setting type")
+            when (setting.id) {
+                SonyAdvancedSettingId.DSEE -> if (!profile.capabilities.dsee) add("DSEE setting requires dsee capability")
+                SonyAdvancedSettingId.PAUSE_WHEN_REMOVED -> if (!profile.controls.pauseWhenRemoved) {
+                    add("pause setting requires pauseWhenRemoved control")
+                }
+            }
+        }
     }
 }
 
@@ -206,6 +228,9 @@ private fun JSONObject.requiredObject(name: String): JSONObject =
 
 private fun JSONObject.optionalObject(name: String): JSONObject? =
     if (has(name) && !isNull(name)) getJSONObject(name) else null
+
+private fun JSONObject.optionalArray(name: String): JSONArray? =
+    if (has(name) && !isNull(name)) getJSONArray(name) else null
 
 private fun JSONObject.requiredString(name: String): String =
     if (has(name) && !isNull(name)) getString(name) else error("missing string $name")
@@ -232,5 +257,18 @@ private fun JSONArray.stringList(name: String): List<String> = buildList {
         val value = optString(index)
         if (value.isBlank()) error("$name contains an empty value")
         add(value)
+    }
+}
+
+private fun JSONArray.advancedSettings(): List<SonyAdvancedSettingConfig> = buildList {
+    for (index in 0 until length()) {
+        val item = optJSONObject(index) ?: error("advancedSettings[$index] must be an object")
+        add(
+            SonyAdvancedSettingConfig(
+                id = SonyAdvancedSettingId.valueOf(item.requiredString("id")),
+                type = SonyAdvancedSettingType.valueOf(item.requiredString("type")),
+                order = item.requiredInt("order"),
+            ),
+        )
     }
 }

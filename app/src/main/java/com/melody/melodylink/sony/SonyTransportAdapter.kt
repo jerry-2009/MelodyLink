@@ -7,6 +7,7 @@ import com.melody.melodylink.sony.config.SonyDeviceCatalog
 import com.melody.melodylink.sony.config.SonyConfigRegistry
 import com.melody.melodylink.sony.config.SonyDeviceConfig
 import com.melody.melodylink.sony.config.SonySupportLevel
+import com.melody.melodylink.sony.config.SonyAdvancedSettingId
 import com.op.bttest.sony.SonyAncMode
 import com.op.bttest.sony.SonyAncState
 import com.op.bttest.sony.SonyBatteryState
@@ -32,6 +33,8 @@ class SonyTransportAdapter @JvmOverloads constructor(
         fun onConnecting()
         fun onConnected(state: SonyAncState)
         fun onBatteryState(state: SonyBatteryState)
+        fun onSettingState(id: SonyAdvancedSettingId, value: Boolean)
+        fun onSettingWriteResult(id: SonyAdvancedSettingId, success: Boolean, value: Boolean?, reason: String)
         fun onAncWriteResult(success: Boolean, state: SonyAncState?, reason: String)
         fun onCommandSessionFinished(reason: String)
         fun onDisconnected()
@@ -173,6 +176,7 @@ class SonyTransportAdapter @JvmOverloads constructor(
                         listener.onBatteryState(it)
                     }
                     listener.onConnected(state)
+                    readSupportedAdvancedSettings(candidateProtocol, requestedConfig)
                     return@launch
                 } catch (cancelled: CancellationException) {
                     candidate.disconnect()
@@ -290,6 +294,66 @@ class SonyTransportAdapter @JvmOverloads constructor(
         device.uuids?.map { it.uuid }?.toSet().orEmpty()
     } catch (_: SecurityException) {
         emptySet()
+    }
+
+    fun readSetting(id: SonyAdvancedSettingId) {
+        scope.launch {
+            val p = protocol ?: return@launch
+            val value = readSettingValue(p, id)
+            if (value != null) {
+                listener.onSettingState(id, value)
+            } else {
+                listener.onSettingWriteResult(id, false, null, "Sony setting read failed")
+            }
+        }
+    }
+
+    fun writeSetting(id: SonyAdvancedSettingId, value: Boolean) {
+        val request = generation.get()
+        scope.launch {
+            val p = protocol
+            if (!isConnected || p == null) {
+                listener.onSettingWriteResult(id, false, null, "Sony setting write requested while disconnected")
+                return@launch
+            }
+            val config = activeConfig
+            val allowed = config?.advancedSettings?.any { it.id == id } == true &&
+                config.supportLevel.permitsWrites
+            if (!allowed) {
+                listener.onSettingWriteResult(id, false, null, "Sony setting is not enabled for this profile")
+                return@launch
+            }
+            try {
+                val sent = when (id) {
+                    SonyAdvancedSettingId.DSEE -> p.setDseeEnabled(value)
+                    SonyAdvancedSettingId.PAUSE_WHEN_REMOVED -> p.setPauseWhenRemovedEnabled(value)
+                }
+                // A successful setter confirms the command according to its protocol policy.
+                // Do not issue another query here: older devices such as WF-1000XM3 can time
+                // out on an immediate follow-up read even after accepting the write.
+                val confirmed = if (sent && request == generation.get()) value else null
+                listener.onSettingWriteResult(id, confirmed == value, confirmed, if (confirmed == value) "" else "Sony setting readback failed")
+                if (confirmed == value) disconnectAfterCommand("${id.name} command completed")
+            } catch (throwable: Throwable) {
+                listener.onSettingWriteResult(id, false, null, "Sony setting write failed")
+            }
+        }
+    }
+
+    private suspend fun readSupportedAdvancedSettings(p: SonyProtocol, config: SonyDeviceConfig?) {
+        config?.advancedSettings?.sortedBy { it.order }?.forEach { setting ->
+            val value = readSettingValue(p, setting.id)
+            if (value != null) {
+                listener.onSettingState(setting.id, value)
+            } else {
+                listener.onSettingWriteResult(setting.id, false, null, "Sony setting read failed")
+            }
+        }
+    }
+
+    private suspend fun readSettingValue(p: SonyProtocol, id: SonyAdvancedSettingId): Boolean? = when (id) {
+        SonyAdvancedSettingId.DSEE -> p.getDseeEnabled()
+        SonyAdvancedSettingId.PAUSE_WHEN_REMOVED -> p.getPauseWhenRemovedEnabled()
     }
 
     @SuppressLint("MissingPermission")

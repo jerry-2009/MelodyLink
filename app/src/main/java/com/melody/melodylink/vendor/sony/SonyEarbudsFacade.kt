@@ -10,6 +10,7 @@ import com.melody.melodylink.domain.DeviceCatalog
 import com.melody.melodylink.earbuds.EarbudsFacade
 import com.melody.melodylink.sony.SonyTransportAdapter
 import com.melody.melodylink.sony.config.SonyConfigRegistry
+import com.melody.melodylink.sony.config.SonyAdvancedSettingId
 import com.op.bttest.sony.SonyAncMode
 import com.op.bttest.sony.SonyAncState
 import com.op.bttest.sony.SonyBatteryState
@@ -30,6 +31,11 @@ class SonyEarbudsFacade @JvmOverloads constructor(
         override fun onConnected(state: SonyAncState) = listener.onConnected(state.toDomain())
 
         override fun onBatteryState(state: SonyBatteryState) = listener.onBatteryState(state.toDomain())
+
+        override fun onSettingState(id: SonyAdvancedSettingId, value: Boolean) = listener.onSettingState(id, value)
+
+        override fun onSettingWriteResult(id: SonyAdvancedSettingId, success: Boolean, value: Boolean?, reason: String) =
+            listener.onSettingWriteResult(id, success, value, reason)
 
         override fun onAncWriteResult(success: Boolean, state: SonyAncState?, reason: String) =
             listener.onAncWriteResult(success, state?.toDomain(), reason)
@@ -61,6 +67,10 @@ class SonyEarbudsFacade @JvmOverloads constructor(
     override fun setAncMode(mode: AncMode) = transport.setAncMode(mode.toSony(), 10, false)
 
     override fun refreshBattery() = transport.refreshBattery()
+
+    override fun readSetting(id: SonyAdvancedSettingId) = transport.readSetting(id)
+
+    override fun writeSetting(id: SonyAdvancedSettingId, value: Boolean) = transport.writeSetting(id, value)
 
     private fun SonyAncState.toDomain() = EarbudsState(
         capabilities = capabilities,

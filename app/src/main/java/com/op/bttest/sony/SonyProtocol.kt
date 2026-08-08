@@ -100,6 +100,53 @@ class SonyProtocol(
         return state.takeIf { received }
     }
 
+    suspend fun getDseeEnabled(): Boolean? {
+        ensureInitialized()
+        val response = client.sendCommandForResponse(
+            messageType = SonyMessageType.COMMAND_1,
+            payload = SonyPayloads.buildGetDseePayload(version),
+            timeoutMs = 5_000L,
+        ) { frame ->
+            frame.messageType == SonyMessageType.COMMAND_1 &&
+                SonyPayloads.parseDseeState(frame.payload, version) != null
+        } ?: return null
+        return SonyPayloads.parseDseeState(response.payload, version)
+    }
+
+    suspend fun setDseeEnabled(enabled: Boolean): Boolean {
+        ensureInitialized()
+        // Match the established MelodyPlugin implementation.  Older Sony V1 devices,
+        // including WF-1000XM3, acknowledge E8 but frequently do not answer an immediate
+        // follow-up E6 query.  The command ACK is therefore the reliable completion signal.
+        return client.sendCommand(
+            messageType = SonyMessageType.COMMAND_1,
+            payload = SonyPayloads.buildSetDseePayload(version, enabled),
+        )
+    }
+
+    suspend fun getPauseWhenRemovedEnabled(): Boolean? {
+        ensureInitialized()
+        val response = client.sendCommandForResponse(
+            messageType = SonyMessageType.COMMAND_1,
+            payload = SonyPayloads.buildGetPauseWhenRemovedPayload(version),
+            timeoutMs = 5_000L,
+        ) { frame ->
+            frame.messageType == SonyMessageType.COMMAND_1 &&
+                SonyPayloads.parsePauseWhenRemovedState(frame.payload, version) != null
+        } ?: return null
+        return SonyPayloads.parsePauseWhenRemovedState(response.payload, version)
+    }
+
+    suspend fun setPauseWhenRemovedEnabled(enabled: Boolean): Boolean {
+        ensureInitialized()
+        if (!client.sendCommand(
+                messageType = SonyMessageType.COMMAND_1,
+                payload = SonyPayloads.buildSetPauseWhenRemovedPayload(version, enabled),
+            )
+        ) return false
+        return getPauseWhenRemovedEnabled() == enabled
+    }
+
     private suspend fun ensureInitialized() {
         if (!initialized) {
             initialized = initialize()
@@ -313,6 +360,51 @@ internal object SonyPayloads {
         }
     }
 
+    fun buildGetDseePayload(version: SonyProtocolVersion): ByteArray = byteArrayOf(
+        when (version) {
+            SonyProtocolVersion.V1 -> SonyPayloadTypeV1T1.AUDIO_GET_PARAM
+            SonyProtocolVersion.V2 -> SonyPayloadTypeV2T1.AUDIO_GET_PARAM
+        }.asByte(),
+        if (version == SonyProtocolVersion.V1) 0x02 else 0x01,
+    )
+
+    fun buildSetDseePayload(version: SonyProtocolVersion, enabled: Boolean): ByteArray = when (version) {
+        SonyProtocolVersion.V1 -> byteArrayOf(0xE8.toByte(), 0x02, 0x00, if (enabled) 0x01 else 0x00)
+        SonyProtocolVersion.V2 -> byteArrayOf(0xE8.toByte(), 0x01, if (enabled) 0x01 else 0x00)
+    }
+
+    fun parseDseeState(payload: ByteArray, version: SonyProtocolVersion): Boolean? {
+        val expectedOpcode = when (version) {
+            SonyProtocolVersion.V1 -> setOf(SonyPayloadTypeV1T1.AUDIO_RET_PARAM, SonyPayloadTypeV1T1.AUDIO_NTFY_PARAM)
+            SonyProtocolVersion.V2 -> setOf(SonyPayloadTypeV2T1.AUDIO_RET_PARAM, SonyPayloadTypeV2T1.AUDIO_NTFY_PARAM)
+        }
+        if (payload.firstOrNull()?.u8() !in expectedOpcode) return null
+        val value = when (version) {
+            SonyProtocolVersion.V1 -> if (payload.size == 4 && payload[1].u8() == 0x02 && payload[2].u8() == 0x00) payload[3].u8() else return null
+            SonyProtocolVersion.V2 -> if (payload.size == 3 && payload[1].u8() == 0x01) payload[2].u8() else return null
+        }
+        return value.toBooleanOrNull()
+    }
+
+    fun buildGetPauseWhenRemovedPayload(version: SonyProtocolVersion): ByteArray = byteArrayOf(
+        0xF6.toByte(),
+        if (version == SonyProtocolVersion.V1) 0x03 else 0x01,
+    )
+
+    fun buildSetPauseWhenRemovedPayload(version: SonyProtocolVersion, enabled: Boolean): ByteArray = when (version) {
+        SonyProtocolVersion.V1 -> byteArrayOf(0xF8.toByte(), 0x03, 0x00, if (enabled) 0x01 else 0x00)
+        SonyProtocolVersion.V2 -> byteArrayOf(0xF8.toByte(), 0x01, if (enabled) 0x00 else 0x01)
+    }
+
+    fun parsePauseWhenRemovedState(payload: ByteArray, version: SonyProtocolVersion): Boolean? {
+        if (payload.firstOrNull()?.u8() !in setOf(0xF7, 0xF9)) return null
+        val value = when (version) {
+            SonyProtocolVersion.V1 -> if (payload.size == 4 && payload[1].u8() == 0x03 && payload[2].u8() == 0x00) payload[3].u8() else return null
+            SonyProtocolVersion.V2 -> if (payload.size == 3 && payload[1].u8() == 0x01) payload[2].u8() else return null
+        }.toBooleanOrNull() ?: return null
+        return if (version == SonyProtocolVersion.V1) value else !value
+    }
+
     fun buildV1SetAmbientPayload(
         state: SonyAncState,
         windSupported: Boolean,
@@ -474,4 +566,10 @@ internal object SonyPayloads {
     }
 
     private fun parseAmbientLevel(raw: Int): Int = if (raw in 0..20) raw else 10
+
+    private fun Int.toBooleanOrNull(): Boolean? = when (this) {
+        0x00 -> false
+        0x01 -> true
+        else -> null
+    }
 }

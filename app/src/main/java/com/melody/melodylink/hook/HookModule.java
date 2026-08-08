@@ -6,6 +6,8 @@ import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.app.Application;
 import android.content.pm.ApplicationInfo;
+import android.content.Context;
+import android.content.ContextWrapper;
 import android.content.res.AssetManager;
 import android.net.Uri;
 import android.os.Handler;
@@ -13,8 +15,6 @@ import android.os.Looper;
 import android.util.Log;
 import android.view.View;
 import android.view.ViewGroup;
-import android.widget.Button;
-import android.widget.LinearLayout;
 import android.widget.ImageView;
 
 import com.melody.melodylink.observer.MethodCallObserver;
@@ -29,14 +29,18 @@ import com.melody.melodylink.sony.config.SonyConfigIssue;
 import com.melody.melodylink.sony.config.SonyConfigLoadResult;
 import com.melody.melodylink.sony.config.SonyConfigLoader;
 import com.melody.melodylink.sony.config.SonyDeviceConfig;
+import com.melody.melodylink.sony.config.SonyAdvancedSettingId;
 
 import java.lang.reflect.Method;
 import java.lang.reflect.Field;
 import java.lang.reflect.Constructor;
+import java.lang.reflect.Proxy;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.util.Collection;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executors;
@@ -52,7 +56,9 @@ import io.github.libxposed.api.XposedInterface;
 public final class HookModule extends XposedModule {
     private static final String TAG = "MelodyLinkObserver";
     private static final String TARGET = "com.oplus.melody";
-    private static final int CUSTOM_ANC_CONTROLS_TAG = 0x4D4C4143;
+    private static final String ADVANCED_CATEGORY_KEY = "melodylink.advanced_settings";
+    private static final String ADVANCED_SETTING_KEY_PREFIX = "melodylink.setting.";
+    private static final String SOUND_QUALITY_TITLE = "音质音效";
     private static final int WF_1000XM3_PRODUCT_ID = 0x067410;
     private volatile int targetAddressHash;
     private volatile String targetAddress;
@@ -63,20 +69,26 @@ public final class HookModule extends XposedModule {
     private volatile ClassLoader melodyClassLoader;
     private volatile CompletableFuture<Object> pendingNoiseWrite;
     private volatile AncMode pendingAncMode;
+    private final Map<SonyAdvancedSettingId, Boolean> pendingSonySettings = new ConcurrentHashMap<>();
+    private final Map<SonyAdvancedSettingId, Boolean> confirmedSonySettings = new ConcurrentHashMap<>();
     private volatile boolean pendingBatteryRefresh;
     private volatile ScheduledExecutorService foregroundStateWatcher;
     private volatile String lastForegroundStateFingerprint;
     private volatile String lastSonyCommandFingerprint;
     private volatile String lastSonyBatteryCommandNonce;
+    private volatile String lastSonySettingCommandNonce;
     private volatile boolean sonyConfigInitialized;
     private final MelodyDeviceBridge deviceBridge = new MelodyDeviceBridge();
     private volatile AssetManager sonyModuleAssets;
     private volatile SonyDeviceConfig activeSonyImageProfile;
     private volatile boolean retainSharedSonyStateAfterCommandDisconnect;
     private volatile boolean activityLifecycleRegistered;
+    private volatile Activity detailActivity;
+    private volatile Object lastAudioPreferenceAnchor;
     private volatile int startedActivityCount;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final ThreadLocal<Boolean> detailAncWriteObserved = new ThreadLocal<>();
+    private final Map<SonyAdvancedSettingId, Object> advancedPreferences = new ConcurrentHashMap<>();
     private final EarbudsFacade sonyTransport = new SonyEarbudsFacade(new EarbudsFacade.Listener() {
         @Override
         public void onConnecting() {
@@ -97,6 +109,26 @@ public final class HookModule extends XposedModule {
         public void onBatteryState(EarbudsState state) {
             sonySessionState.acceptBattery(state);
             publishSonyBatteryState("Sony battery read");
+        }
+
+        @Override
+        public void onSettingState(SonyAdvancedSettingId id, boolean value) {
+            updateAdvancedSetting(id, value);
+            confirmedSonySettings.put(id, value);
+            writeSharedSonyState();
+        }
+
+        @Override
+        public void onSettingWriteResult(SonyAdvancedSettingId id, boolean success, Boolean value, String reason) {
+            if (success && value != null) {
+                updateAdvancedSetting(id, value);
+                confirmedSonySettings.put(id, value);
+                writeSharedSonyState();
+            }
+            if (!success) {
+                setAdvancedSettingEnabled(id, true);
+                log(Log.WARN, TAG, event("Sony setting " + id + " failed: " + reason));
+            }
         }
 
         @Override
@@ -151,10 +183,14 @@ public final class HookModule extends XposedModule {
         public void onFailed(String reason) {
             failPendingNoiseWrite(reason);
             pendingAncMode = null;
+            pendingSonySettings.clear();
             pendingBatteryRefresh = false;
             sonySessionState.clear();
             clearSharedSonyState();
             log(Log.WARN, TAG, event("Sony RFCOMM failed: " + reason));
+            for (SonyAdvancedSettingId id : advancedPreferences.keySet()) {
+                setAdvancedSettingEnabled(id, true);
+            }
             refreshTargetRepository("Sony failed");
         }
 
@@ -173,6 +209,7 @@ public final class HookModule extends XposedModule {
                 clearStaleSharedSonyState();
                 clearSharedSonyCommand();
                 clearSharedSonyBatteryCommand();
+                clearSharedSonySettingCommand();
                 registerAppVisibilityLifecycleCallbacks();
                 if (sonyTransport.isConnected()) {
                     writeSharedSonyState();
@@ -195,6 +232,11 @@ public final class HookModule extends XposedModule {
             hookNamed(loader, "com.oplus.melody.ui.component.detail.DetailMainViewModel", "f", 1, "detailState");
             hookNamed(loader, "com.oplus.melody.ui.component.detail.DetailMainViewModel", "g", 1, "detailConnectionState");
             hookNamed(loader, "com.oplus.melody.ui.component.detail.DetailMainActivity", "onCreate", 1, "detailActivityCreate");
+            // JADX labels this class v9.t; the runtime name in Melody 16.8.3 is v9.C1594t.
+            hookNamed(loader, "v9.C1594t", "onViewCreated", 2, "detailPreferenceHostCreated");
+            // MelodyCodecTweaker's stable entry: every DetailMain preference page inherits this.
+            hookNamed(loader, "androidx.preference.g", "onViewCreated", 2,
+                    "detailPreferenceFragmentViewCreated");
             hookNamed(loader, "com.oplus.melody.onespace.items.OneSpaceHeaderPreference", "i", 1, "sonyCardImage");
             hookNamed(loader, "com.oplus.melody.onespace.items.OneSpaceHeaderPreference", "onBindViewHolder", 1, "sonyCardBind");
             hookNamed(loader, "com.oplus.melody.onespace.items.OneSpaceHeaderPreference", "onShowAnimationEnd", 0, "sonyCardLoading");
@@ -328,14 +370,24 @@ public final class HookModule extends XposedModule {
                     if ("detailActivityCreate".equals(label)) {
                         Object result = chain.proceed();
                         if (chain.getThisObject() instanceof Activity) {
-                            scheduleCustomAncControls((Activity) chain.getThisObject(),
-                                    method.getDeclaringClass().getClassLoader());
+                            detailActivity = (Activity) chain.getThisObject();
                             requestSonyBatteryRefresh();
                         }
                         return result;
                     }
+                    if ("detailPreferenceHostCreated".equals(label)) {
+                        Object result = chain.proceed();
+                        schedulePreferenceFragmentBinding(chain.getThisObject());
+                        return result;
+                    }
+                    if ("detailPreferenceFragmentViewCreated".equals(label)) {
+                        Object result = chain.proceed();
+                        scheduleDirectPreferenceFragmentBinding(chain.getThisObject());
+                        return result;
+                    }
                     if ("noiseReductionItemDataChanged".equals(label)) {
                         Object result = chain.proceed();
+                        lastAudioPreferenceAnchor = chain.getThisObject();
                         log(Log.INFO, TAG, event("Melody native ANC LiveData callback completed"));
                         return result;
                     }
@@ -685,12 +737,6 @@ public final class HookModule extends XposedModule {
         return future;
     }
 
-    private void scheduleCustomAncControls(Activity activity, ClassLoader loader) {
-        View root = activity.getWindow().getDecorView();
-        root.postDelayed(() -> installCustomAncControls(activity, loader), 750L);
-        root.postDelayed(() -> installCustomAncControls(activity, loader), 2_000L);
-    }
-
     private void removeUnsupportedDetailCategory(Object preference) {
         if (preference == null) return;
         try {
@@ -712,46 +758,6 @@ public final class HookModule extends XposedModule {
         } catch (Throwable t) {
             log(Log.WARN, TAG, "native detail category removal failed", t);
         }
-    }
-
-    private void installCustomAncControls(Activity activity, ClassLoader loader) {
-        String address = targetAddress;
-        if (address == null) address = readSharedSonyAddress();
-        if (!isTargetAddress(address)) return;
-
-        ViewGroup root = activity.findViewById(android.R.id.content);
-        View nativeControl = findViewByClassName(root,
-                "com.oplus.melody.ui.component.detail.opsreduction.buttonseekbar.NoiseReductionButtonSeekBarView");
-        if (nativeControl == null || !(nativeControl.getParent() instanceof ViewGroup)) return;
-        ViewGroup parent = (ViewGroup) nativeControl.getParent();
-        if (parent.findViewWithTag(CUSTOM_ANC_CONTROLS_TAG) != null) return;
-
-        nativeControl.setVisibility(View.GONE);
-        LinearLayout controls = new LinearLayout(activity);
-        controls.setTag(CUSTOM_ANC_CONTROLS_TAG);
-        controls.setOrientation(LinearLayout.HORIZONTAL);
-        controls.setGravity(android.view.Gravity.CENTER);
-        controls.setPadding(24, 16, 24, 16);
-        controls.addView(createAncButton(activity, "关闭", 0, loader),
-                new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-        controls.addView(createAncButton(activity, "环境声", 1, loader),
-                new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-        controls.addView(createAncButton(activity, "降噪", 2, loader),
-                new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-        parent.addView(controls, new ViewGroup.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-        log(Log.INFO, TAG, event("installed custom Sony ANC controls"));
-    }
-
-    private Button createAncButton(Activity activity, String text, int modeIndex, ClassLoader loader) {
-        Button button = new Button(activity);
-        button.setText(text);
-        button.setAllCaps(false);
-        button.setOnClickListener(view -> {
-            log(Log.INFO, TAG, event("custom Sony ANC click mode=" + modeIndex));
-            dispatchCustomAncWrite(modeIndex, loader);
-        });
-        return button;
     }
 
     private void dispatchCustomAncWrite(int modeIndex, ClassLoader loader) {
@@ -1119,13 +1125,20 @@ public final class HookModule extends XposedModule {
         return application == null ? null : MelodySharedStateStore.from(application).batteryCommandFile();
     }
 
+    private static File sharedSettingCommandFile() {
+        Application application = currentApplication();
+        return application == null ? null : MelodySharedStateStore.from(application).settingCommandFile();
+    }
+
     private void writeSharedSonyState() {
         if (!isPrimaryProcess() || targetAddress == null) return;
         File file = sharedStateFile();
         if (file == null) return;
         EarbudsState state = sonySessionState.getAnc();
         int mode = MelodyStateBridge.INSTANCE.ancModeIndex(state);
-        if (MelodySharedStateStore.writeState(file, targetAddress, android.os.Process.myPid(), mode)) {
+        if (MelodySharedStateStore.writeState(file, targetAddress, android.os.Process.myPid(), mode,
+                confirmedSonySettings.get(SonyAdvancedSettingId.DSEE),
+                confirmedSonySettings.get(SonyAdvancedSettingId.PAUSE_WHEN_REMOVED))) {
             log(Log.INFO, TAG, event("shared Sony state published addressHash="
                     + Integer.toHexString(targetAddress.hashCode()) + " mode=" + mode));
         } else {
@@ -1175,6 +1188,7 @@ public final class HookModule extends XposedModule {
         clearSharedSonyState();
         clearSharedSonyCommand();
         clearSharedSonyBatteryCommand();
+        clearSharedSonySettingCommand();
         log(Log.INFO, TAG, event(reason + "; releasing Sony RFCOMM session"));
         sonyTransport.disconnect();
         refreshTargetRepository(reason);
@@ -1296,6 +1310,14 @@ public final class HookModule extends XposedModule {
             sonyTransport.setAncMode(mode);
             return;
         }
+        if (!pendingSonySettings.isEmpty()) {
+            Map<SonyAdvancedSettingId, Boolean> pending = new java.util.HashMap<>(pendingSonySettings);
+            pendingSonySettings.keySet().removeAll(pending.keySet());
+            for (Map.Entry<SonyAdvancedSettingId, Boolean> entry : pending.entrySet()) {
+                log(Log.INFO, TAG, event("sending queued Sony setting " + entry.getKey()));
+                sonyTransport.writeSetting(entry.getKey(), entry.getValue());
+            }
+        }
         if (pendingBatteryRefresh) {
             pendingBatteryRefresh = false;
             log(Log.INFO, TAG, event("sending queued Sony battery refresh after temporary connection"));
@@ -1311,6 +1333,15 @@ public final class HookModule extends XposedModule {
         return written;
     }
 
+    private boolean writeSharedSonySettingCommand(String address, SonyAdvancedSettingId id, boolean value) {
+        File file = sharedSettingCommandFile();
+        if (file == null) return false;
+        boolean written = MelodySharedStateStore.writeSettingCommand(
+                file, address, id.name(), value, Long.toString(System.nanoTime()));
+        if (!written) log(Log.WARN, TAG, "shared Sony setting command write failed");
+        return written;
+    }
+
     private void clearSharedSonyBatteryCommand() {
         File file = sharedBatteryCommandFile();
         if (!MelodySharedStateStore.delete(file)) {
@@ -1318,8 +1349,518 @@ public final class HookModule extends XposedModule {
         }
     }
 
+    private void clearSharedSonySettingCommand() {
+        File file = sharedSettingCommandFile();
+        if (!MelodySharedStateStore.delete(file)) {
+            log(Log.WARN, TAG, "shared Sony setting command delete failed");
+        }
+    }
+
     private static MelodySharedStateStore.SharedBatteryCommand readSharedSonyBatteryCommand() {
         return MelodySharedStateStore.readBatteryCommand(sharedBatteryCommandFile());
+    }
+
+    private static MelodySharedStateStore.SharedSettingCommand readSharedSonySettingCommand() {
+        return MelodySharedStateStore.readSettingCommand(sharedSettingCommandFile());
+    }
+
+    private void installAdvancedSettings(Object anchor) {
+        if (!isAdvancedSettingsAnchor(anchor) || activeSonyImageProfile == null
+                || activeSonyImageProfile.getAdvancedSettings().isEmpty()) return;
+        try {
+            Object soundGroup = invokeNoArg(anchor, "getParent");
+            if (soundGroup == null) return;
+            Object parent = invokeNoArg(soundGroup, "getParent");
+            if (parent == null) parent = soundGroup;
+            if (findPreference(parent, ADVANCED_CATEGORY_KEY) != null
+                    || findPreferenceByKeyRecursive(parent, ADVANCED_CATEGORY_KEY)) return;
+            ClassLoader loader = anchor.getClass().getClassLoader();
+            Object context = invokeNoArg(anchor, "getContext");
+            Activity activity = context instanceof Context ? findActivity((Context) context) : null;
+            if (activity == null) activity = detailActivity;
+            if (activity == null) return;
+            Object category = newPreference(loader,
+                    "com.oplus.melody.common.widget.MelodyCOUIPreferenceCategory", activity);
+            if (category == null) category = newPreference(loader,
+                    "com.coui.appcompat.preference.COUIPreferenceCategory", activity);
+            if (category == null) return;
+            setPreferenceValue(category, "setTitle", "高级设置");
+            setPreferenceValue(category, "setKey", ADVANCED_CATEGORY_KEY);
+            Integer order = (Integer) invokeNoArg(soundGroup, "getOrder");
+            if (order != null) setPreferenceValue(category, "setOrder", order + 1);
+            if (!addPreference(parent, category, loader)) {
+                log(Log.WARN, TAG, event("advanced settings category could not be added"));
+                return;
+            }
+            advancedPreferences.clear();
+            if (isPrimaryProcess() && !sonyTransport.isConnected()) {
+                connectTargetSonyTransport("advanced settings read");
+            }
+            for (com.melody.melodylink.sony.config.SonyAdvancedSettingConfig setting
+                    : activeSonyImageProfile.getAdvancedSettings()) {
+                Object item = newSwitchPreference(loader, activity);
+                if (item == null) {
+                    log(Log.WARN, TAG, event("advanced setting switch constructor unavailable id="
+                            + setting.getId()));
+                    continue;
+                }
+                String key = ADVANCED_SETTING_KEY_PREFIX + setting.getId().name().toLowerCase();
+                setPreferenceValue(item, "setKey", key);
+                setPreferenceValue(item, "setOrder", setting.getOrder());
+                setPreferenceValue(item, "setTitle", setting.getId() == SonyAdvancedSettingId.DSEE
+                        ? "DSEE" : "摘下暂停");
+                setPreferenceValue(item, "setSummary", setting.getId() == SonyAdvancedSettingId.DSEE
+                        ? "提升压缩音源的音质" : "摘下耳机时自动暂停播放");
+                setPreferenceValue(item, "setEnabled", false);
+                installSettingListener(item, setting.getId(), loader);
+                if (addPreference(category, item, loader)) {
+                    advancedPreferences.put(setting.getId(), item);
+                    if (sonyTransport.isConnected()) sonyTransport.readSetting(setting.getId());
+                } else {
+                    log(Log.WARN, TAG, event("advanced setting add rejected id=" + setting.getId()));
+                }
+            }
+            log(Log.INFO, TAG, event("installed Sony advanced settings category"));
+        } catch (Throwable t) {
+            log(Log.WARN, TAG, "advanced settings installation failed", t);
+        }
+    }
+
+    private void schedulePreferenceFragmentBinding(Object hostFragment) {
+        if (hostFragment == null || activeSonyImageProfile == null
+                || activeSonyImageProfile.getAdvancedSettings().isEmpty()) return;
+        Object activityValue = invokeNoArg(hostFragment, "getActivity");
+        if (!(activityValue instanceof Activity)) {
+            log(Log.WARN, TAG, event("advanced settings host activity unavailable"));
+            return;
+        }
+        Activity activity = (Activity) activityValue;
+        Object manager = invokeNoArg(hostFragment, "getChildFragmentManager");
+        if (manager == null) {
+            log(Log.WARN, TAG, event("advanced settings child fragment manager unavailable"));
+            return;
+        }
+        long[] delays = new long[]{0L, 50L, 200L, 500L, 1000L};
+        for (int i = 0; i < delays.length; i++) {
+            final boolean reportFailure = i == delays.length - 1;
+            mainHandler.postDelayed(() -> {
+                try {
+                    Object fragment = findTaggedFragment(manager, "DetailMainPreferenceFragment");
+                    if (fragment == null) {
+                        if (reportFailure) log(Log.WARN, TAG,
+                                event("advanced settings preference fragment not found"));
+                        return;
+                    }
+                    if (!"v9.z".equals(fragment.getClass().getName())) {
+                        if (reportFailure) log(Log.WARN, TAG, event(
+                                "advanced settings unexpected preference fragment="
+                                        + fragment.getClass().getName()));
+                        return;
+                    }
+                    installAdvancedSettingsFromPreferenceFragment(activity, fragment);
+                } catch (Throwable t) {
+                    if (reportFailure) log(Log.WARN, TAG,
+                            "advanced settings fragment binding failed", t);
+                }
+            }, delays[i]);
+        }
+    }
+
+    private void scheduleDirectPreferenceFragmentBinding(Object fragment) {
+        if (fragment == null || activeSonyImageProfile == null
+                || activeSonyImageProfile.getAdvancedSettings().isEmpty()) return;
+        Object activityValue = invokeNoArg(fragment, "getActivity");
+        if (!(activityValue instanceof Activity)) return;
+        Activity activity = (Activity) activityValue;
+        long[] delays = new long[]{0L, 50L, 200L, 500L, 1000L};
+        for (int i = 0; i < delays.length; i++) {
+            final boolean reportFailure = i == delays.length - 1;
+            mainHandler.postDelayed(() -> {
+                try {
+                    installAdvancedSettingsFromPreferenceFragment(activity, fragment);
+                } catch (Throwable t) {
+                    if (reportFailure) log(Log.WARN, TAG,
+                            "direct advanced settings preference binding failed", t);
+                }
+            }, delays[i]);
+        }
+    }
+
+    private static Object findTaggedFragment(Object manager, String tag) {
+        for (Method method : allMethods(manager.getClass())) {
+            if (!method.getName().equals("D") || method.getParameterTypes().length != 1
+                    || method.getParameterTypes()[0] != String.class) continue;
+            try {
+                method.setAccessible(true);
+                return method.invoke(manager, tag);
+            } catch (Throwable ignored) {
+            }
+        }
+        return null;
+    }
+
+    private void installAdvancedSettingsFromPreferenceFragment(Activity activity, Object fragment) {
+        try {
+            ClassLoader loader = fragment.getClass().getClassLoader();
+            Class<?> managerType = Class.forName("androidx.preference.g", false, loader);
+            Object preferenceManager = null;
+            for (Field field : allFields(managerType)) {
+                if (field.getType().getName().equals("androidx.preference.k")) {
+                    field.setAccessible(true);
+                    preferenceManager = field.get(fragment);
+                    if (preferenceManager != null) break;
+                }
+            }
+            if (preferenceManager == null) throw new IllegalStateException("preference manager unavailable");
+            Object screen = null;
+            for (Field field : allFields(preferenceManager.getClass())) {
+                if (field.getType().getName().equals("androidx.preference.PreferenceScreen")) {
+                    field.setAccessible(true);
+                    screen = field.get(preferenceManager);
+                    if (screen != null) break;
+                }
+            }
+            if (screen == null) throw new IllegalStateException("preference screen unavailable");
+            Object anchor = findPreferenceByTitle(screen, SOUND_QUALITY_TITLE);
+            if (anchor == null) throw new IllegalStateException("audio quality anchor unavailable");
+            Object parent = invokeNoArg(anchor, "getParent");
+            if (parent == null) throw new IllegalStateException("audio quality parent unavailable");
+            if (findPreference(parent, ADVANCED_CATEGORY_KEY) != null
+                    || findPreferenceByKeyRecursive(parent, ADVANCED_CATEGORY_KEY)) return;
+            Object category = newPreference(loader,
+                    "com.oplus.melody.common.widget.MelodyCOUIPreferenceCategory", activity);
+            if (category == null) category = newPreference(loader,
+                    "com.coui.appcompat.preference.COUIPreferenceCategory", activity);
+            if (category == null) throw new IllegalStateException("category constructor unavailable");
+            setPreferenceValue(category, "setTitle", "\u9ad8\u7ea7\u8bbe\u7f6e");
+            setPreferenceValue(category, "setKey", ADVANCED_CATEGORY_KEY);
+            Integer order = (Integer) invokeNoArg(anchor, "getOrder");
+            if (order != null) setPreferenceValue(category, "setOrder", order + 1);
+            if (!addPreference(parent, category, loader)) throw new IllegalStateException("category add rejected");
+            advancedPreferences.clear();
+            for (com.melody.melodylink.sony.config.SonyAdvancedSettingConfig setting
+                    : activeSonyImageProfile.getAdvancedSettings()) {
+                Object item = newSwitchPreference(loader, activity);
+                if (item == null) continue;
+                String key = ADVANCED_SETTING_KEY_PREFIX + setting.getId().name().toLowerCase();
+                setPreferenceValue(item, "setKey", key);
+                setPreferenceValue(item, "setOrder", setting.getOrder());
+                setPreferenceValue(item, "setTitle", setting.getId() == SonyAdvancedSettingId.DSEE
+                        ? "DSEE" : "\u6458\u4e0b\u6682\u505c");
+                setPreferenceValue(item, "setSummary", setting.getId() == SonyAdvancedSettingId.DSEE
+                        ? "\u63d0\u5347\u538b\u7f29\u97f3\u6e90\u7684\u97f3\u8d28"
+                        : "\u6458\u4e0b\u8033\u673a\u65f6\u81ea\u52a8\u6682\u505c\u64ad\u653e");
+                setPreferenceValue(item, "setPersistent", false);
+                setPreferenceValue(item, "setVisible", true);
+                setPreferenceValue(item, "setEnabled", false);
+                installSettingListener(item, setting.getId(), loader);
+                if (addPreference(category, item, loader)) {
+                    advancedPreferences.put(setting.getId(), item);
+                    if (isPrimaryProcess()) {
+                        if (!sonyTransport.isConnected()) connectTargetSonyTransport("advanced settings read");
+                        else sonyTransport.readSetting(setting.getId());
+                    } else {
+                        setPreferenceValue(item, "setEnabled", true);
+                        applySharedAdvancedSettings(readSharedSonyState());
+                    }
+                }
+            }
+            log(Log.INFO, TAG, event("advanced settings installed via preference fragment anchor="
+                    + anchor.getClass().getName() + " fragment=" + fragment.getClass().getName()));
+        } catch (Throwable t) {
+            log(Log.WARN, TAG, "advanced settings preference fragment installation failed", t);
+        }
+    }
+
+    private static Object findPreferenceByClass(Object group, String className) {
+        if (group == null) return null;
+        if (group.getClass().getName().equals(className)) return group;
+        Field childrenField = null;
+        for (Field field : allFields(group.getClass())) {
+            if (Collection.class.isAssignableFrom(field.getType())
+                    || java.util.List.class.isAssignableFrom(field.getType())) {
+                childrenField = field;
+                break;
+            }
+        }
+        if (childrenField == null) return null;
+        try {
+            childrenField.setAccessible(true);
+            Object value = childrenField.get(group);
+            if (!(value instanceof Collection)) return null;
+            for (Object child : (Collection<?>) value) {
+                Object found = findPreferenceByClass(child, className);
+                if (found != null) return found;
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
+    }
+
+    private static Object findPreferenceByTitle(Object group, String title) {
+        if (group == null) return null;
+        Object currentTitle = invokeNoArg(group, "getTitle");
+        if (currentTitle != null && title.equals(currentTitle.toString().trim())) return group;
+        Field childrenField = null;
+        for (Field field : allFields(group.getClass())) {
+            if (Collection.class.isAssignableFrom(field.getType())) {
+                childrenField = field;
+                break;
+            }
+        }
+        if (childrenField == null) return null;
+        try {
+            childrenField.setAccessible(true);
+            Object children = childrenField.get(group);
+            if (!(children instanceof Collection)) return null;
+            for (Object child : (Collection<?>) children) {
+                Object found = findPreferenceByTitle(child, title);
+                if (found != null) return found;
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
+    }
+
+    private static boolean findPreferenceByKeyRecursive(Object group, String key) {
+        if (group == null) return false;
+        Object value = invokeNoArg(group, "getKey");
+        if (key.equals(value)) return true;
+        Field childrenField = null;
+        for (Field field : allFields(group.getClass())) {
+            if (Collection.class.isAssignableFrom(field.getType())
+                    || java.util.List.class.isAssignableFrom(field.getType())) {
+                childrenField = field;
+                break;
+            }
+        }
+        if (childrenField == null) return false;
+        try {
+            childrenField.setAccessible(true);
+            Object children = childrenField.get(group);
+            if (children instanceof Collection) {
+                for (Object child : (Collection<?>) children) {
+                    if (findPreferenceByKeyRecursive(child, key)) return true;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return false;
+    }
+
+    private static Field findField(Class<?> type, String name) {
+        for (Class<?> current = type; current != null; current = current.getSuperclass()) {
+            try { return current.getDeclaredField(name); } catch (NoSuchFieldException ignored) { }
+        }
+        return null;
+    }
+
+    private static Field[] allFields(Class<?> type) {
+        java.util.ArrayList<Field> fields = new java.util.ArrayList<>();
+        for (Class<?> current = type; current != null; current = current.getSuperclass()) {
+            for (Field field : current.getDeclaredFields()) fields.add(field);
+        }
+        return fields.toArray(new Field[0]);
+    }
+
+    private static Method[] allMethods(Class<?> type) {
+        java.util.ArrayList<Method> methods = new java.util.ArrayList<>();
+        for (Class<?> current = type; current != null; current = current.getSuperclass()) {
+            for (Method method : current.getDeclaredMethods()) methods.add(method);
+        }
+        return methods.toArray(new Method[0]);
+    }
+
+    private void updateAdvancedSetting(SonyAdvancedSettingId id, Boolean value) {
+        Object preference = advancedPreferences.get(id);
+        if (preference == null || value == null) return;
+        mainHandler.post(() -> {
+            setPreferenceValue(preference, "setChecked", value);
+            setPreferenceValue(preference, "setEnabled", true);
+        });
+    }
+
+    private void applySharedAdvancedSettings(MelodySharedStateStore.SharedState state) {
+        if (state == null) return;
+        if (state.dsee != null) updateAdvancedSetting(SonyAdvancedSettingId.DSEE, state.dsee);
+        if (state.pauseWhenRemoved != null) {
+            updateAdvancedSetting(SonyAdvancedSettingId.PAUSE_WHEN_REMOVED, state.pauseWhenRemoved);
+        }
+    }
+
+    private void setAdvancedSettingEnabled(SonyAdvancedSettingId id, boolean enabled) {
+        Object preference = advancedPreferences.get(id);
+        if (preference == null) return;
+        mainHandler.post(() -> setPreferenceValue(preference, "setEnabled", enabled));
+    }
+
+    private void installSettingListener(Object preference, SonyAdvancedSettingId id, ClassLoader loader) {
+        Method listenerSetter = null;
+        for (Method candidate : allMethods(preference.getClass())) {
+            if (candidate.getName().equals("setOnPreferenceChangeListener")
+                    && candidate.getParameterTypes().length == 1) {
+                listenerSetter = candidate;
+                break;
+            }
+        }
+        if (listenerSetter == null || !listenerSetter.getParameterTypes()[0].isInterface()) {
+            log(Log.WARN, TAG, event("advanced setting listener unavailable id=" + id));
+            return;
+        }
+        Class<?> listenerType = listenerSetter.getParameterTypes()[0];
+        Method callback = null;
+        for (Method candidate : listenerType.getMethods()) {
+            if (candidate.getReturnType() == Boolean.TYPE && candidate.getParameterTypes().length == 2) {
+                callback = candidate;
+                break;
+            }
+        }
+        final Method changeCallback = callback;
+        Object listener = Proxy.newProxyInstance(loader, new Class<?>[]{listenerType}, (proxy, method, args) -> {
+            if ("toString".equals(method.getName())) return "MelodyLinkSettingListener";
+            if ("hashCode".equals(method.getName())) return System.identityHashCode(proxy);
+            if ("equals".equals(method.getName())) return proxy == (args == null ? null : args[0]);
+            if (changeCallback == null || !method.getName().equals(changeCallback.getName())
+                    || args == null || args.length < 2 || !(args[1] instanceof Boolean)) return null;
+            Boolean value = (Boolean) args[1];
+            setPreferenceValue(preference, "setEnabled", false);
+            if (isPrimaryProcess() && sonyTransport.isConnected()) {
+                sonyTransport.writeSetting(id, value);
+            } else if (!isPrimaryProcess()) {
+                String address = targetAddress == null ? readSharedSonyAddress() : targetAddress;
+                if (address == null || !isTargetAddress(address)
+                        || !writeSharedSonySettingCommand(address, id, value)) {
+                    setAdvancedSettingEnabled(id, true);
+                    log(Log.WARN, TAG, event("Sony setting " + id
+                            + " skipped: primary process command forwarding unavailable"));
+                } else {
+                    log(Log.INFO, TAG, event("forwarded Sony setting " + id + " to primary process"));
+                    // The command acknowledgement is delivered in the primary process.  Keep
+                    // this foreground preference responsive while that process performs I/O.
+                    updateAdvancedSetting(id, value);
+                }
+            } else {
+                pendingSonySettings.put(id, value);
+                if (!connectTargetSonyTransport("advanced setting write")) {
+                    pendingSonySettings.remove(id);
+                    setAdvancedSettingEnabled(id, true);
+                    log(Log.WARN, TAG, event("Sony setting " + id
+                            + " skipped: target Bluetooth device is unavailable"));
+                }
+            }
+            return true;
+        });
+        try {
+            listenerSetter.setAccessible(true);
+            listenerSetter.invoke(preference, listener);
+        } catch (Throwable t) {
+            log(Log.WARN, TAG, "advanced setting listener attach failed id=" + id, t);
+        }
+    }
+
+    private static boolean isAdvancedSettingsAnchor(Object preference) {
+        if (preference == null) return false;
+        String className = preference.getClass().getName();
+        if (className.equals("com.oplus.melody.onespace.items.OneSpaceNoisePreference")
+                || className.equals("com.oplus.melody.ui.component.detail.spatialaudio.SpatialAudioItem")
+                || className.equals("com.oplus.melody.ui.component.detail.noisereduction.NoiseReductionItem")) {
+            return true;
+        }
+        Object title = invokeNoArg(preference, "getTitle");
+        return title != null && SOUND_QUALITY_TITLE.equals(title.toString().trim());
+    }
+
+    private static Object newPreference(ClassLoader loader, String typeName, Context context) {
+        try {
+            Class<?> type = Class.forName(typeName, false, loader);
+            try {
+                Constructor<?> constructor = type.getConstructor(android.content.Context.class,
+                        android.util.AttributeSet.class);
+                return constructor.newInstance(context, null);
+            } catch (NoSuchMethodException ignored) {
+                return type.getConstructor(android.content.Context.class).newInstance(context);
+            }
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private static Object newSwitchPreference(ClassLoader loader, Context context) {
+        for (String typeName : new String[]{
+                "com.oplus.melody.ui.widget.MelodyUiTipsSwitchPreference",
+                "com.coui.appcompat.preference.COUISwitchPreference",
+                "androidx.preference.SwitchPreferenceCompat"}) {
+            Object preference = newPreference(loader, typeName, context);
+            if (preference != null) return preference;
+        }
+        return null;
+    }
+
+    private static Activity findActivity(Context context) {
+        Context current = context;
+        while (current instanceof ContextWrapper) {
+            if (current instanceof Activity) return (Activity) current;
+            current = ((ContextWrapper) current).getBaseContext();
+        }
+        return current instanceof Activity ? (Activity) current : null;
+    }
+
+    private static boolean addPreference(Object parent, Object child, ClassLoader loader) {
+        try {
+            Class<?> preference = Class.forName("androidx.preference.Preference", false, loader);
+            for (String name : new String[]{"addPreference", "f"}) {
+                for (Method method : allMethods(parent.getClass())) {
+                    if (!method.getName().equals(name) || method.getParameterTypes().length != 1
+                            || !method.getParameterTypes()[0].isAssignableFrom(child.getClass())) continue;
+                    try {
+                        method.setAccessible(true);
+                        Object result = method.invoke(parent, child);
+                        return !(result instanceof Boolean) || (Boolean) result;
+                    } catch (Throwable ignored) {
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return false;
+    }
+
+    private static Object findPreference(Object group, String key) {
+        for (String name : new String[]{"findPreference", "e"}) {
+            try {
+                Method method = group.getClass().getMethod(name, CharSequence.class);
+                return method.invoke(group, key);
+            } catch (Throwable ignored) {
+            }
+        }
+        return null;
+    }
+
+    private static Object invokeNoArg(Object target, String name) {
+        try {
+            for (Method method : allMethods(target.getClass())) {
+                if (method.getName().equals(name) && method.getParameterTypes().length == 0) {
+                    method.setAccessible(true);
+                    return method.invoke(target);
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
+    }
+
+    private static void setPreferenceValue(Object target, String name, Object value) {
+        if (target == null) return;
+        for (Method method : allMethods(target.getClass())) {
+            if (method.getName().equals(name) && method.getParameterTypes().length == 1) {
+                try {
+                    method.setAccessible(true);
+                    method.invoke(target, value);
+                    return;
+                } catch (Throwable ignored) {
+                }
+            }
+        }
     }
 
     private static MelodySharedStateStore.SharedCommand readSharedSonyCommand() {
@@ -1383,11 +1924,12 @@ public final class HookModule extends XposedModule {
         if (isPrimaryProcess()) {
             observeSharedSonyCommand();
             observeSharedSonyBatteryCommand();
+            observeSharedSonySettingCommand();
         }
         MelodySharedStateStore.SharedState state = readSharedSonyState();
         String fingerprint = state == null
                 ? null
-                : state.address + "\n" + state.modeIndex;
+                : state.address + "\n" + state.modeIndex + "\n" + state.dsee + "\n" + state.pauseWhenRemoved;
         if (fingerprint == null ? lastForegroundStateFingerprint == null
                 : fingerprint.equals(lastForegroundStateFingerprint)) {
             return;
@@ -1395,6 +1937,7 @@ public final class HookModule extends XposedModule {
         lastForegroundStateFingerprint = fingerprint;
         if (state != null) {
             rememberTargetAddress(state.address);
+            if (!isPrimaryProcess()) applySharedAdvancedSettings(state);
         }
         log(Log.INFO, TAG, event("foreground Sony state changed; requesting native Melody LiveData refresh"
                 + " mode=" + (state == null ? -1 : state.modeIndex)));
@@ -1424,6 +1967,30 @@ public final class HookModule extends XposedModule {
             return;
         }
         sonyTransport.refreshBattery();
+    }
+
+    private void observeSharedSonySettingCommand() {
+        MelodySharedStateStore.SharedSettingCommand command = readSharedSonySettingCommand();
+        if (command == null || command.nonce.equals(lastSonySettingCommandNonce)) return;
+        lastSonySettingCommandNonce = command.nonce;
+        if (!isTargetAddress(command.address)) {
+            log(Log.WARN, TAG, event("ignored Sony setting command for a different device"));
+            return;
+        }
+        SonyAdvancedSettingId id;
+        try {
+            id = SonyAdvancedSettingId.valueOf(command.settingId);
+        } catch (IllegalArgumentException ignored) {
+            log(Log.WARN, TAG, event("ignored unknown Sony setting command"));
+            return;
+        }
+        pendingSonySettings.put(id, command.value);
+        if (sonyTransport.isConnected()) {
+            runPendingSonyOperation();
+        } else if (!connectTargetSonyTransport("forwarded advanced setting write")) {
+            pendingSonySettings.remove(id);
+            log(Log.WARN, TAG, event("Sony setting " + id + " skipped: target Bluetooth device is unavailable"));
+        }
     }
 
     private void refreshTargetRepository(String reason) {

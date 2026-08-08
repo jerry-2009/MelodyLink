@@ -104,6 +104,14 @@ object SonyPayloadTypeV1T1 {
     const val NC_ASM_RET_PARAM = 0x67
     const val NC_ASM_SET_PARAM = 0x68
     const val NC_ASM_NTFY_PARAM = 0x69
+    const val AUDIO_GET_PARAM = 0xE6
+    const val AUDIO_RET_PARAM = 0xE7
+    const val AUDIO_SET_PARAM = 0xE8
+    const val AUDIO_NTFY_PARAM = 0xE9
+    const val SYSTEM_GET_PARAM = 0xF2
+    const val SYSTEM_RET_PARAM = 0xF3
+    const val SYSTEM_SET_PARAM = 0xF4
+    const val SYSTEM_NTFY_PARAM = 0xF5
 }
 
 object SonyPayloadTypeV2T1 {
@@ -120,6 +128,14 @@ object SonyPayloadTypeV2T1 {
     const val NCASM_RET_PARAM = 0x67
     const val NCASM_SET_PARAM = 0x68
     const val NCASM_NTFY_PARAM = 0x69
+    const val AUDIO_GET_PARAM = 0xE6
+    const val AUDIO_RET_PARAM = 0xE7
+    const val AUDIO_SET_PARAM = 0xE8
+    const val AUDIO_NTFY_PARAM = 0xE9
+    const val SYSTEM_GET_PARAM = 0xF2
+    const val SYSTEM_RET_PARAM = 0xF3
+    const val SYSTEM_SET_PARAM = 0xF4
+    const val SYSTEM_NTFY_PARAM = 0xF5
 }
 
 object SonyBatteryType {

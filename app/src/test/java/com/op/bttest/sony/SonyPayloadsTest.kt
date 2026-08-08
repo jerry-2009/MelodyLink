@@ -184,4 +184,25 @@ class SonyPayloadsTest {
             ),
         )
     }
+
+    @Test
+    fun buildsAndParsesDseeForBothProtocolVersions() {
+        assertArrayEquals(byteArrayOf(0xE6.toByte(), 0x02), SonyPayloads.buildGetDseePayload(SonyProtocolVersion.V1))
+        assertArrayEquals(byteArrayOf(0xE8.toByte(), 0x02, 0x00, 0x01), SonyPayloads.buildSetDseePayload(SonyProtocolVersion.V1, true))
+        assertEquals(true, SonyPayloads.parseDseeState(byteArrayOf(0xE7.toByte(), 0x02, 0x00, 0x01), SonyProtocolVersion.V1))
+        assertArrayEquals(byteArrayOf(0xE6.toByte(), 0x01), SonyPayloads.buildGetDseePayload(SonyProtocolVersion.V2))
+        assertArrayEquals(byteArrayOf(0xE8.toByte(), 0x01, 0x00), SonyPayloads.buildSetDseePayload(SonyProtocolVersion.V2, false))
+        assertEquals(false, SonyPayloads.parseDseeState(byteArrayOf(0xE9.toByte(), 0x01, 0x00), SonyProtocolVersion.V2))
+    }
+
+    @Test
+    fun buildsAndParsesPauseWhenRemovedForBothProtocolVersions() {
+        assertArrayEquals(byteArrayOf(0xF6.toByte(), 0x03), SonyPayloads.buildGetPauseWhenRemovedPayload(SonyProtocolVersion.V1))
+        assertArrayEquals(byteArrayOf(0xF8.toByte(), 0x03, 0x00, 0x01), SonyPayloads.buildSetPauseWhenRemovedPayload(SonyProtocolVersion.V1, true))
+        assertEquals(true, SonyPayloads.parsePauseWhenRemovedState(byteArrayOf(0xF7.toByte(), 0x03, 0x00, 0x01), SonyProtocolVersion.V1))
+        assertArrayEquals(byteArrayOf(0xF6.toByte(), 0x01), SonyPayloads.buildGetPauseWhenRemovedPayload(SonyProtocolVersion.V2))
+        assertArrayEquals(byteArrayOf(0xF8.toByte(), 0x01, 0x01), SonyPayloads.buildSetPauseWhenRemovedPayload(SonyProtocolVersion.V2, false))
+        assertEquals(true, SonyPayloads.parsePauseWhenRemovedState(byteArrayOf(0xF9.toByte(), 0x01, 0x00), SonyProtocolVersion.V2))
+        assertEquals(false, SonyPayloads.parsePauseWhenRemovedState(byteArrayOf(0xF7.toByte(), 0x01, 0x01), SonyProtocolVersion.V2))
+    }
 }
