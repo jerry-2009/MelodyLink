@@ -3,21 +3,18 @@ package com.melody.melodylink.sony
 import android.annotation.SuppressLint
 import android.bluetooth.BluetoothDevice
 import com.melody.melodylink.sony.config.DeviceIdentity
-import com.melody.melodylink.sony.config.SonyBatteryLayout
+import com.melody.melodylink.sony.config.SonyDeviceCatalog
 import com.melody.melodylink.sony.config.SonyConfigRegistry
 import com.melody.melodylink.sony.config.SonyDeviceConfig
 import com.melody.melodylink.sony.config.SonySupportLevel
 import com.op.bttest.sony.SonyAncMode
 import com.op.bttest.sony.SonyAncState
-import com.op.bttest.sony.SonyBatteryType
 import com.op.bttest.sony.SonyBatteryState
 import com.op.bttest.sony.SonyLogEntry
 import com.op.bttest.sony.SonyPayloads
 import com.op.bttest.sony.SonyProtocol
 import com.op.bttest.sony.SonyProtocolVersion
 import com.op.bttest.sony.SonyRfcommClient
-import com.op.bttest.sony.SonyUuids
-import java.util.UUID
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -29,8 +26,8 @@ import kotlinx.coroutines.launch
 /** Target-only Sony transport facade with a Java-callable callback surface. */
 class SonyTransportAdapter @JvmOverloads constructor(
     private val listener: Listener,
-    configRegistry: SonyConfigRegistry? = SonyConfigRegistry.empty(),
-) {
+    configRegistry: SonyDeviceCatalog? = SonyConfigRegistry.empty(),
+) : SonyTransportPort {
     interface Listener {
         fun onConnecting()
         fun onConnected(state: SonyAncState)
@@ -49,14 +46,15 @@ class SonyTransportAdapter @JvmOverloads constructor(
     private var protocol: SonyProtocol? = null
     private var activeConfig: SonyDeviceConfig? = null
     @Volatile
-    private var configRegistry: SonyConfigRegistry? = configRegistry
+    private var configRegistry: SonyDeviceCatalog? = configRegistry
+    private var connectionPlanner = SonyConnectionPlanner(configRegistry)
     @Volatile
     private var experimentalWritesEnabled = false
     private var connectingAddress: String? = null
     private var connectedAddress: String? = null
 
     @Volatile
-    var isConnected: Boolean = false
+    override var isConnected: Boolean = false
         private set
 
     @Volatile
@@ -67,11 +65,12 @@ class SonyTransportAdapter @JvmOverloads constructor(
     var currentBatteryState: SonyBatteryState? = null
         private set
 
-    fun setConfigRegistry(registry: SonyConfigRegistry) {
+    override fun setConfigRegistry(registry: SonyDeviceCatalog) {
         configRegistry = registry
+        connectionPlanner = SonyConnectionPlanner(registry)
     }
 
-    fun isRegisteredDevice(bluetoothName: String?): Boolean =
+    override fun isRegisteredDevice(bluetoothName: String?): Boolean =
         bluetoothName != null && configRegistry?.findBest(DeviceIdentity(bluetoothName = bluetoothName)) != null
 
     /** Enables writes only for profiles explicitly marked EXPERIMENTAL. */
@@ -81,7 +80,7 @@ class SonyTransportAdapter @JvmOverloads constructor(
 
     @SuppressLint("MissingPermission")
     @Synchronized
-    fun connect(device: BluetoothDevice) {
+    override fun connect(device: BluetoothDevice) {
         val address = try {
             device.address
         } catch (_: SecurityException) {
@@ -119,7 +118,7 @@ class SonyTransportAdapter @JvmOverloads constructor(
             connectedAddress = null
             activeConfig = null
 
-            val versions = protocolCandidates(device, requestedConfig)
+            val versions = connectionPlanner.protocolCandidates(deviceUuids(device), requestedConfig)
             var lastFailure = "no Sony protocol connection succeeded"
             for (version in versions) {
                 if (request != generation.get()) return@launch
@@ -169,7 +168,7 @@ class SonyTransportAdapter @JvmOverloads constructor(
                     connectedAddress = address
                     connectingAddress = null
                     activeConfig = requestedConfig
-                    candidateProtocol.getBatteryState(batteryTypes(requestedConfig))?.let {
+                    candidateProtocol.getBatteryState(connectionPlanner.batteryTypes(requestedConfig))?.let {
                         currentBatteryState = it
                         listener.onBatteryState(it)
                     }
@@ -195,7 +194,7 @@ class SonyTransportAdapter @JvmOverloads constructor(
     }
 
     @Synchronized
-    fun disconnect() {
+    override fun disconnect() {
         generation.incrementAndGet()
         activeJob?.cancel()
         activeJob = scope.launch {
@@ -213,7 +212,7 @@ class SonyTransportAdapter @JvmOverloads constructor(
         }
     }
 
-    fun setAncMode(mode: SonyAncMode, ambientLevel: Int, focusOnVoice: Boolean) {
+    override fun setAncMode(mode: SonyAncMode, ambientLevel: Int, focusOnVoice: Boolean) {
         val request = generation.get()
         scope.launch {
             val activeProtocol = protocol
@@ -257,7 +256,7 @@ class SonyTransportAdapter @JvmOverloads constructor(
         }
     }
 
-    fun refreshBattery() {
+    override fun refreshBattery() {
         val request = generation.get()
         scope.launch {
             val activeProtocol = protocol
@@ -266,7 +265,7 @@ class SonyTransportAdapter @JvmOverloads constructor(
                 return@launch
             }
             try {
-                val state = activeProtocol.getBatteryState(batteryTypes(activeConfig))
+                val state = activeProtocol.getBatteryState(connectionPlanner.batteryTypes(activeConfig))
                 if (state != null && request == generation.get()) {
                     currentBatteryState = state
                     listener.onBatteryState(state)
@@ -287,36 +286,15 @@ class SonyTransportAdapter @JvmOverloads constructor(
     }
 
     @SuppressLint("MissingPermission")
-    private fun protocolCandidates(
-        device: BluetoothDevice,
-        config: SonyDeviceConfig?,
-    ): List<SonyProtocolVersion> {
-        if (config != null) {
-            val knownUuids = try {
-                device.uuids?.map { it.uuid }?.toSet().orEmpty()
-            } catch (_: SecurityException) {
-                emptySet()
-            }
-            return config.protocol.versions.sortedWith(
-                compareByDescending<SonyProtocolVersion> { config.protocol.rfcommUuids[it] in knownUuids }
-                    .thenByDescending { it == config.protocol.preferredVersion },
-            )
-        }
-        return try {
-            val uuids: Set<UUID> = device.uuids?.map { it.uuid }?.toSet().orEmpty()
-            when {
-                SonyUuids.V2 in uuids -> listOf(SonyProtocolVersion.V2, SonyProtocolVersion.V1)
-                SonyUuids.V1 in uuids -> listOf(SonyProtocolVersion.V1, SonyProtocolVersion.V2)
-                else -> listOf(SonyProtocolVersion.V2, SonyProtocolVersion.V1)
-            }
-        } catch (_: SecurityException) {
-            listOf(SonyProtocolVersion.V2, SonyProtocolVersion.V1)
-        }
+    private fun deviceUuids(device: BluetoothDevice): Set<java.util.UUID> = try {
+        device.uuids?.map { it.uuid }?.toSet().orEmpty()
+    } catch (_: SecurityException) {
+        emptySet()
     }
 
     @SuppressLint("MissingPermission")
     private fun resolveConfig(device: BluetoothDevice): SonyDeviceConfig? =
-        configRegistry?.findBest(
+        connectionPlanner.resolve(
             DeviceIdentity(
                 bluetoothName = try {
                     device.name
@@ -326,9 +304,4 @@ class SonyTransportAdapter @JvmOverloads constructor(
             ),
         )
 
-    private fun batteryTypes(config: SonyDeviceConfig?): IntArray = when (config?.battery?.layout) {
-        SonyBatteryLayout.LEFT_RIGHT_CASE -> intArrayOf(SonyBatteryType.DUAL, SonyBatteryType.CASE)
-        SonyBatteryLayout.LEFT_RIGHT -> intArrayOf(SonyBatteryType.DUAL)
-        else -> intArrayOf()
-    }
 }

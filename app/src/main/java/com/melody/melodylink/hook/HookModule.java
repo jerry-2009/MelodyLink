@@ -19,6 +19,7 @@ import android.widget.ImageView;
 
 import com.melody.melodylink.observer.MethodCallObserver;
 import com.melody.melodylink.sony.SonyTransportAdapter;
+import com.melody.melodylink.sony.SonyTransportPort;
 import com.melody.melodylink.sony.config.SonyConfigIssue;
 import com.melody.melodylink.sony.config.SonyConfigLoadResult;
 import com.melody.melodylink.sony.config.SonyConfigLoader;
@@ -61,8 +62,7 @@ public final class HookModule extends XposedModule {
     private volatile String targetAddress;
     private volatile BluetoothDevice targetSonyDevice;
     private volatile Object earphoneRepository;
-    private volatile SonyAncState sonyState;
-    private volatile SonyBatteryState sonyBatteryState;
+    private final SonySessionState sonySessionState = new SonySessionState();
     private volatile ClassLoader melodyClassLoader;
     private volatile CompletableFuture<Object> pendingNoiseWrite;
     private volatile SonyAncMode pendingAncMode;
@@ -80,7 +80,7 @@ public final class HookModule extends XposedModule {
     private volatile int startedActivityCount;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final ThreadLocal<Boolean> detailAncWriteObserved = new ThreadLocal<>();
-    private final SonyTransportAdapter sonyTransport = new SonyTransportAdapter(new SonyTransportAdapter.Listener() {
+    private final SonyTransportPort sonyTransport = new SonyTransportAdapter(new SonyTransportAdapter.Listener() {
         @Override
         public void onConnecting() {
             log(Log.INFO, TAG, event("Sony RFCOMM connecting"));
@@ -88,7 +88,7 @@ public final class HookModule extends XposedModule {
 
         @Override
         public void onConnected(SonyAncState state) {
-            sonyState = state;
+            sonySessionState.acceptAnc(state);
             writeSharedSonyState();
             log(Log.INFO, TAG, event("Sony RFCOMM connected; ANC state=" + state.getMode()));
             publishSonyBatteryState("Sony connected");
@@ -98,7 +98,7 @@ public final class HookModule extends XposedModule {
 
         @Override
         public void onBatteryState(SonyBatteryState state) {
-            sonyBatteryState = mergeBatteryState(sonyBatteryState, state);
+            sonySessionState.acceptBattery(state);
             publishSonyBatteryState("Sony battery read");
         }
 
@@ -110,7 +110,7 @@ public final class HookModule extends XposedModule {
                 pendingNoiseWrite = null;
             }
             if (success && state != null) {
-                sonyState = state;
+                sonySessionState.acceptAnc(state);
                 writeSharedSonyState();
                 refreshTargetRepository("Sony ANC write");
                 log(Log.INFO, TAG, event("Sony ANC write result status=0 mode="
@@ -144,8 +144,7 @@ public final class HookModule extends XposedModule {
                 log(Log.INFO, TAG, event("Sony RFCOMM released after successful command; device state retained"));
                 return;
             }
-            sonyState = null;
-            sonyBatteryState = null;
+            sonySessionState.clear();
             clearSharedSonyState();
             log(Log.INFO, TAG, event("Sony RFCOMM disconnected"));
             refreshTargetRepository("Sony disconnected");
@@ -156,8 +155,7 @@ public final class HookModule extends XposedModule {
             failPendingNoiseWrite(reason);
             pendingAncMode = null;
             pendingBatteryRefresh = false;
-            sonyState = null;
-            sonyBatteryState = null;
+            sonySessionState.clear();
             clearSharedSonyState();
             log(Log.WARN, TAG, event("Sony RFCOMM failed: " + reason));
             refreshTargetRepository("Sony failed");
@@ -469,7 +467,8 @@ public final class HookModule extends XposedModule {
                         } else if ("dtoInitCompleted".equals(label)) {
                             result = isSonyConnected();
                         } else if ("dtoNoiseReductionMode".equals(label)) {
-                            int mode = sonyState == null ? readSharedSonyModeIndex() : SonyModeMapper.toMelodyIndex(sonyState.getMode());
+                            SonyAncState state = sonySessionState.anc;
+                            int mode = state == null ? readSharedSonyModeIndex() : SonyModeMapper.toMelodyIndex(state.getMode());
                             if (mode >= 0) result = mode;
                         }
                     }
@@ -483,7 +482,8 @@ public final class HookModule extends XposedModule {
                     }
                     if (("opsNoiseReductionMode".equals(label) || "noiseReductionModeVO".equals(label))
                             && isSonyConnected()) {
-                        int mode = sonyState == null ? readSharedSonyModeIndex() : SonyModeMapper.toMelodyIndex(sonyState.getMode());
+                        SonyAncState state = sonySessionState.anc;
+                        int mode = state == null ? readSharedSonyModeIndex() : SonyModeMapper.toMelodyIndex(state.getMode());
                         if (mode >= 0) result = mode;
                     }
                     if (traceCall || result != null && "deviceRegistryGet".equals(label)) {
@@ -1126,7 +1126,8 @@ public final class HookModule extends XposedModule {
         if (!isPrimaryProcess() || targetAddress == null) return;
         File file = sharedStateFile();
         if (file == null) return;
-        int mode = sonyState == null ? -1 : SonyModeMapper.toMelodyIndex(sonyState.getMode());
+        SonyAncState state = sonySessionState.anc;
+        int mode = state == null ? -1 : SonyModeMapper.toMelodyIndex(state.getMode());
         String content = targetAddress + "\n" + android.os.Process.myPid() + "\n" + mode + "\n";
         try (FileOutputStream output = new FileOutputStream(file, false)) {
             output.write(content.getBytes(StandardCharsets.US_ASCII));
@@ -1180,8 +1181,7 @@ public final class HookModule extends XposedModule {
         pendingAncMode = null;
         pendingBatteryRefresh = false;
         failPendingNoiseWrite(reason);
-        sonyState = null;
-        sonyBatteryState = null;
+        sonySessionState.clear();
         clearSharedSonyState();
         clearSharedSonyCommand();
         clearSharedSonyBatteryCommand();
@@ -1541,13 +1541,9 @@ public final class HookModule extends XposedModule {
         }
     }
 
-    private static SonyBatteryState mergeBatteryState(SonyBatteryState previous, SonyBatteryState incoming) {
-        return previous == null ? incoming : previous.merge(incoming);
-    }
-
     private void publishSonyBatteryState(String reason) {
         if (!isPrimaryProcess()) return;
-        SonyBatteryState state = sonyBatteryState;
+        SonyBatteryState state = sonySessionState.battery;
         Object repository = earphoneRepository;
         String address = targetAddress;
         if (state == null || repository == null || address == null) {
@@ -1632,9 +1628,10 @@ public final class HookModule extends XposedModule {
     private void projectSonyAncModeIntoDto(Object address, Object dto) {
         if (!isTargetAddress(address) || dto == null) return;
 
-        int mode = sonyState == null
+        SonyAncState state = sonySessionState.anc;
+        int mode = state == null
                 ? readSharedSonyModeIndex()
-                : SonyModeMapper.toMelodyIndex(sonyState.getMode());
+                : SonyModeMapper.toMelodyIndex(state.getMode());
         if (mode < 0) {
             log(Log.WARN, TAG, event("Melody DTO ANC projection skipped: Sony mode unavailable"));
             return;

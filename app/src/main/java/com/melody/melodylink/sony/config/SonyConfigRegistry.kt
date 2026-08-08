@@ -1,8 +1,14 @@
 package com.melody.melodylink.sony.config
 
+/** Read-only boundary used by transport and hooks to resolve device profiles. */
+interface SonyDeviceCatalog {
+    fun findBest(identity: DeviceIdentity): SonyDeviceConfig?
+    fun profile(id: String): SonyDeviceConfig?
+}
+
 class SonyConfigRegistry private constructor(
     val profiles: List<SonyDeviceConfig>,
-) {
+) : SonyDeviceCatalog {
     init {
         require(profiles.map { it.id }.distinct().size == profiles.size) { "duplicate Sony profile id" }
     }
@@ -10,9 +16,9 @@ class SonyConfigRegistry private constructor(
     fun candidates(identity: DeviceIdentity): List<SonyDeviceConfig> =
         SonyDeviceMatcher.candidates(identity, profiles)
 
-    fun findBest(identity: DeviceIdentity): SonyDeviceConfig? = candidates(identity).firstOrNull()
+    override fun findBest(identity: DeviceIdentity): SonyDeviceConfig? = candidates(identity).firstOrNull()
 
-    fun profile(id: String): SonyDeviceConfig? = profiles.firstOrNull { it.id == id }
+    override fun profile(id: String): SonyDeviceConfig? = profiles.firstOrNull { it.id == id }
 
     companion object {
         fun of(profiles: List<SonyDeviceConfig>): SonyConfigRegistry = SonyConfigRegistry(profiles)
