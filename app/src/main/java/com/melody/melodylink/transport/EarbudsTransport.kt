@@ -1,9 +1,11 @@
 package com.melody.melodylink.transport
 
+import android.bluetooth.BluetoothDevice
+import java.util.UUID
 import kotlinx.coroutines.flow.Flow
 
 sealed interface TransportEndpoint {
-    data class Rfcomm(val serviceUuid: String) : TransportEndpoint
+    data class Rfcomm(val device: BluetoothDevice, val serviceUuid: UUID) : TransportEndpoint
     data class Gatt(val serviceUuid: String, val characteristicUuid: String) : TransportEndpoint
 }
 
